@@ -191,7 +191,7 @@ chat messages 数组是“被关在鹦鹉螺壳里”的感官剥夺：超过数
 3. **Xingli-OS（2026.11，本项目）**：把 LOD 视距渲染、动态记忆文件（M_t）、系统一/系统二双回路、自主唤醒、社会化隐私墙、受控自进化，整合为纯 Python、可落地的架构（见 `XINGLI_OS_SPEC.md`）。
    注：“LOD 用于记忆”方向与 2026 年公开出现的一些探索（如 lodmem、OpenViking 的 L0/L1/L2 分层加载）相互印证，属于正在凝聚的共识方向，非本项目独占。
 
-> 诚实声明：v1 的“效果很好”是未受控的轶事实验；本仓库当前处于**架构与规格阶段**，没有可复现的基准数据。请先读 `XINGLI_OS_SPEC.md` 了解验收标准，再评价它。
+> 诚实声明：v1 的“效果很好”是未受控的轶事实验；本仓库当前处于**机制原型阶段**——M1–M4 的闭环可以离线复现（`python demo.py`），但没有任何可复现的**基准数据**。请先读 `XINGLI_OS_SPEC.md` 了解验收标准，再评价它。
 
 ---
 
@@ -219,7 +219,20 @@ chat messages 数组是“被关在鹦鹉螺壳里”的感官剥夺：超过数
 | **M3 社会化与隐私墙** | relations · visibility 物理过滤 · direct/hearsay 溯源 · teach_rule | A 的私密记忆对 B 物理不存在；B 的转述只以待核实线索呈现；教导下一轮生效 |
 | **M4 受控自进化** | sandbox（AST+子进程回归）· Git 账本 · sleep_cycle（LOD 蒸馏+反失忆抽查） | 合法提案自动提交；恶意提案 100% 拦截 + 免疫记忆；`/sleep` 后反失忆抽查通过 |
 
-详见 [`XINGLI_OS_SPEC.md`](./XINGLI_OS_SPEC.md)（含数据契约、公式、目录结构、铁律与 pytest 验收标准，可直接交给 Coding Agent 施工）。
+### 快速开始（离线，不需要任何 API Key）
+
+```bash
+python demo.py          # 50 项机制验证：帧长、公式误差、隐私墙、拦截率……都打印实测数字
+python -m pytest -q     # 57 项自动化测试
+python cli.py --mock    # CLI 聊天台：/as 换人 /frame 看帧 /focus 看视距 /sleep /log /rollback
+```
+
+接真实模型：`cp config.example.toml xingli.toml`，把 `[sys2] provider` 改为
+`openai_compatible` 并设置 `XINGLI_SYS2_KEY`；有 Jev Key 时同法切换 `[sys1]`。
+实现口径、与 SPEC 的偏差、六条铁律的代码落点，见 [`IMPLEMENTATION.md`](./IMPLEMENTATION.md)。
+
+规格与验收原样保留在 [`XINGLI_OS_SPEC.md`](./XINGLI_OS_SPEC.md)（数据契约、公式、目录结构、铁律与 pytest 验收标准）；
+落地时对规格的六处细化（只读范围、焦点降级顺序、准则可见性等）记在 SPEC 第 8 节与 `IMPLEMENTATION.md`——**方向未改，只把口径说死**。
 
 ---
 
@@ -227,10 +240,12 @@ chat messages 数组是“被关在鹦鹉螺壳里”的感官剥夺：超过数
 
 - 架构、数据契约、验收标准：**完成**（SPEC + MIT）
 - 早期验证实验：v1 轶事有效，**无受控数据**
-- 实现：**M1 未完成**；本仓库现阶段没有可运行的星璃
+- 实现：**M1–M4 核心闭环已落地**（纯标准库 Python；57 项 pytest + 50 项离线机制验证，`python demo.py` 可复现）
+- 离线机制验证（mock 大脑，不是真实模型）：60 轮后认知帧 1492 tokens（预算 6000）且不随轮数增长 · 焦点 LOD 公式误差 0 · A 的私密在 B 的帧中物理不存在 · 恶意进化提案 100% 拦截并沉淀免疫记忆 · 反失忆抽查 67% → 100%
+- 仍未验证：真实底座模型的表达质量、真实 Jev 端点的语义准确率、任何 benchmark
 - 基准 / 第三方评测：**无**
 - 作者：单人项目；架构由作者主导，AI 辅助（本 README 的 v2 版由 AI 起草后按作者意图重写）
-- 这是一份设计文档多于一个软件；欢迎 issue 挑战设计，不欢迎 star 崇拜
+- 现在既有设计，也有一个可运行的**机制原型**；但请把它当骨架，不是成品陪伴产品。欢迎 issue 挑战设计，不欢迎 star 崇拜
 
 ---
 

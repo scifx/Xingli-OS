@@ -1,0 +1,16 @@
+# 运行时状态与账本（不属于皮层，也不该进主仓库历史）
+.xingli/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# cortex 的运行时数据：记忆节点、轮次、情绪/焦点状态、睡眠报告
+# （它们由 Git 账本 .xingli/ledger.git 独立追踪，不污染主仓库）
+cortex/episodes/*.json
+cortex/turns/*.json
+cortex/state/*
+!cortex/state/.gitkeep
+cortex/sleep_reports/

@@ -1,0 +1,71 @@
+# 星璃 Xingli-OS 配置示例
+# 复制到工作区根目录并改名为 xingli.toml（或 config.toml）。
+# 不写任何配置、不配任何 Key，也能以离线模式跑通全部机制（mock 大脑 + 本地词法 Sys1）。
+
+# ── System Two：生成式大模型（前额叶）────────────────────────────────
+[sys2]
+# mock            : 离线确定性脚本大脑，只用于验证管线，不是真智能
+# openai_compatible: 任何 OpenAI 兼容端点（官方 / DeepSeek / 本地 vLLM …）
+provider = "mock"
+base_url = "https://api.openai.com/v1"
+api_key_env = "XINGLI_SYS2_KEY"
+model = "gpt-4o-mini"
+temperature = 0.7
+max_tokens = 1400
+timeout_sec = 90
+json_mode = true          # 要求模型返回 JSON 认知包
+
+# ── System One：模糊决策模型（丘脑 / 杏仁核）──────────────────────────
+[sys1]
+# local             : 离线词法近似（无 Key 的开发/测试降级；可复现）
+# jev               : TypeSafe Jev /v1/systemone（或 OpenRouter 的 typesafe/jev-1.13）
+# openai_decisions  : OpenAI /v1/decisions
+# llm_fallback      : 用轻量生成式模型模拟概率输出
+provider = "local"
+base_url = ""             # 例如 "https://api.typesafe.ai" / "https://openrouter.ai/api/v1"
+api_key_env = "XINGLI_SYS1_KEY"
+model = ""                # 例如 "typesafe/jev-1.13"
+timeout_sec = 8
+
+# ── 预算与硬熔断（铁律 6）────────────────────────────────────────────
+[budget]
+frame_tokens = 6000        # 认知帧 + 系统契约的总 Token 上限
+section_env = 700          # 各段初始预算（超出总预算时按优先级压缩）
+section_sys1 = 700
+section_focal = 2300
+section_landscape = 2000
+section_event = 400
+max_chain_ticks = 4        # 单次外部事件触发的最大连环思考拍数
+max_proactive_per_hour = 6 # 每小时自主唤醒配额（同时限制待触发队列长度）
+
+# ── 焦点 LOD 与长期记忆地貌 ──────────────────────────────────────────
+[render]
+theta2 = 0.65              # R ≥ θ2 → LOD2（全文）
+theta1 = 0.25              # θ1 ≤ R < θ2 → LOD1（要点）
+theta0 = 0.08              # θ0 ≤ R < θ1 → LOD0（一行目录）
+landscape_n2 = 4           # 近景条数
+landscape_n1 = 10          # 中景条数
+landscape_n0 = 40          # 远景地平线条数
+turn_lod2_chars = 700      # 单轮全文截断上限（防单条巨物撑爆预算）
+node_lod2_chars = 600
+# 心理距离打分权重（语义 / 时间近度 / 重要度 / 社交关联 / 反射加权）
+weight_semantic = 0.40
+weight_recency = 0.20
+weight_importance = 0.25
+weight_social = 0.10
+weight_boost = 0.05
+
+# ── 睡眠整合 ─────────────────────────────────────────────────────────
+[sleep]
+half_life_days = 7.0       # 艾宾浩斯半衰期
+min_importance = 0.05
+distill_window = 4         # 每 N 轮聚合为一个情景节点
+session_gap_minutes = 45   # 超过这个间隔视为新会话
+sample_size = 3            # 反失忆抽查抽样数
+coverage_threshold = 0.6   # 召回覆盖率低于此值 → 重写索引描述
+lod1_chars = 220
+lod0_chars = 60
+
+# 可选：皮层与运行时的目录名
+# cortex_dir = "cortex"
+# runtime_dir = ".xingli"

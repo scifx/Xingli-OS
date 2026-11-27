@@ -1,0 +1,34 @@
+{
+  "colleague_b": {
+    "custom": {},
+    "display_name": "同事B",
+    "domain_trust": {
+      "personal_gossip": 0.35,
+      "tech_opinion": 0.72
+    },
+    "global_trust": 0.62,
+    "intimacy": 0.35,
+    "role": "colleague"
+  },
+  "owner": {
+    "custom": {
+      "notes": "星璃的创造者与最重要的对话者"
+    },
+    "display_name": "主人",
+    "domain_trust": {
+      "personal_gossip": 1.0,
+      "tech_opinion": 1.0
+    },
+    "global_trust": 1.0,
+    "intimacy": 0.85,
+    "role": "owner"
+  },
+  "stranger": {
+    "custom": {},
+    "display_name": "陌生人",
+    "domain_trust": {},
+    "global_trust": 0.3,
+    "intimacy": 0.05,
+    "role": "stranger"
+  }
+}

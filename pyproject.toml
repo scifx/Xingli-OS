@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xingli-os"
+version = "0.1.0"
+description = "星璃：以动态记忆文件为权重、焦点 LOD、System One 模糊反射与受控自进化的纯 Python 智能体"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []          # 运行时只用标准库
+authors = [{ name = "scifx" }]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+xingli = "cli:main"
+
+[tool.setuptools]
+packages = ["kernel", "memory", "sensors", "cortex", "cortex.skills"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+python_files = ["test_*.py"]

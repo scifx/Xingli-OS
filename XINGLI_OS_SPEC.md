@@ -329,3 +329,29 @@ $\text{Sys2}_\theta$ 默认通过**结构化 JSON 输出（Structured Output / `
 - **先用最小依赖跑通**：核心持久化直接用 Python 标准库 `sqlite3` + `json` + `ast` + `subprocess` + `asyncio`；HTTP 请求用 `httpx`；CLI 交互可用 `prompt_toolkit`（若追求零重依赖也可用标准库 + `asyncio` 异步输入封装）。
 - **配置驱动、Mock 友好**：务必保证在只配置一个普通 OpenAI 兼容 LLM Key（甚至无 Jev Key 时自动回退 `llm_fallback`）的情况下，整套系统 M1–M4 就能开箱运行，同时保留切换到真实 Jev `/v1/systemone` 端点的零改动配置开关。
 - **每写完一个 Milestone 立刻运行 `pytest`**：确保所有不变量（尤其是物理隐私隔离、焦点 LOD 衰减数学正确性、自主唤醒硬熔断与沙盒拦截）都有自动化测试守护，不靠人工肉眼兜底。
+
+---
+
+## 8. 实现注记（本仓库当前状态）
+
+本节由实现者补充，**不修改上面任何方向性设计**，只记录规格落地时必须说死的细节与偏差。
+完整说明见 [`IMPLEMENTATION.md`](./IMPLEMENTATION.md)。
+
+**已交付**：M1–M4 的核心闭环（纯标准库 Python）。`python demo.py` 逐条打印 50 项机制的实测数字
+（帧长、公式误差、隐私墙、拦截率、反失忆通过率），`python -m pytest -q` 为配套的自动化测试。
+
+**落地时需要明确的六处口径**（都不改变设计意图）：
+
+1. **只读范围**从 `kernel/` 扩展到 `kernel/ + memory/ + sensors/ + cli.py`——隐私墙、预算与账本
+   若可被她改写，铁律 3/6 就是空的。`cortex/` 仍是唯一可写皮层。
+2. **`decay` 归属**：反射只保留 `max_delta`，向基线的回弹由情绪状态机每拍统一执行，
+   避免“反射字段里再写一套衰减”造成双重衰减。
+3. **焦点 LOD 的预算降级顺序**：先牺牲最远的非保底轮次 → 再缩短全文截断 → 才动
+   「最近 K 轮保底」；`pinned` 永不因预算降级。
+4. **准则也有可见性**：`policies` 条目带 `visibility`，渲染前过滤；否则私下教的规矩会泄漏。
+5. **反失忆修复**：生成新节点（`refs` 指向旧节点）+ 旧节点 `archived=true` 沉入冷库，
+   同时满足“重写索引描述”与“永不原地改写”。
+6. **唤醒配额**：`已触发/小时` 与 `待触发队列长度` 双闸门；Git 账本使用独立
+   `GIT_DIR=.xingli/ledger.git`，work-tree 指向 `cortex/`，不污染主仓库历史。
+
+**仍未验证**：真实底座模型的表达质量、真实 Jev / Decisions 端点的语义准确率、任何 benchmark。
