@@ -53,6 +53,8 @@ max_tokens = 300          # 仅 llm_fallback 用
 frame_tokens = 6000
 # 一轮里连环思考最多花多久（秒）。本地 4B 一拍可能 15~40s，没有这个刹车就会长时间自转
 max_chain_seconds = 60
+# 自主唤醒触发的连环思考上限（默认 1：没人等着听就别自转）
+max_wake_chain_ticks = 1
 # 自主唤醒最短预约间隔（秒）：模型常写 after_sec=0，会变成自激循环
 min_wake_sec = 30        # 认知帧 + 系统契约 + 身份块的总 Token 上限
 section_identity = 240     # “她是谁”这一块的预算（来自 cortex/persona.py）

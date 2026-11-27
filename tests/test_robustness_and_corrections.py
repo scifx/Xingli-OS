@@ -205,3 +205,75 @@ def test_cognitive_packet_has_no_notes_field(ws: Workspace, clock):
     hb = Heartbeat.create(ws, ws.config, sys2=MockSys2Client(), now_fn=clock)
     result = hb.handle_message("owner", "在吗")
     assert result.says
+
+
+# ---------------------------------------------------------------------------
+# 7) 自主唤醒：不自转、不落空轮次
+# ---------------------------------------------------------------------------
+def test_wake_event_does_not_chain(ws: Workspace, clock):
+    payload = {
+        "inner_monologue": "自己醒一下",
+        "say": "我在这儿。",
+        "wake": {"continue_think": {"reason": "再想想"}},
+    }
+    hb = _hb(ws, clock, JsonBrain(payload))
+    hb.scheduler.schedule(60, reason="测试唤醒", now=clock())
+    clock.advance(61)
+    fired = hb.poll_wakes()
+    assert len(fired) == 1
+    assert len(fired[0].ticks) == 1, "自主唤醒不该连转四拍"
+    assert "MAX_WAKE_CHAIN_TICKS" in fired[0].halted_reason
+
+
+def test_quiet_wake_does_not_write_a_turn(ws: Workspace, clock):
+    hb = _hb(ws, clock, JsonBrain({"inner_monologue": "没什么好说的", "say": ""}))
+    hb.scheduler.schedule(60, reason="空跑", now=clock())
+    clock.advance(61)
+    hb.poll_wakes()
+    assert hb.store.list_turns("owner") == [], "没说话、没思考，就不该留下轮次"
+
+
+# ---------------------------------------------------------------------------
+# 8) sys1 配了却没生效：必须说出来，而不是静默退回
+# ---------------------------------------------------------------------------
+def test_sys1_with_model_but_local_provider_is_promoted(ws: Workspace):
+    import cli
+
+    cfg = ws.config.with_sys1(provider="local", model="Kev-4B-GGUF", base_url="http://127.0.0.1:8080/v1")
+    cli.SYS1_NOTICES.clear()
+    promoted = cli._maybe_promote_sys1(cfg)
+    assert promoted.sys1.provider == "llm_fallback"
+    assert any("自动接管" in n for n in cli.SYS1_NOTICES)
+
+
+def test_sys1_build_error_is_reported():
+    from kernel.config import Config, Sys1Config
+    from kernel.sys1_jev import build_client
+
+    cfg = Config(sys1=Sys1Config(provider="llm_fallback", base_url=""))
+    client = build_client(cfg)
+    assert getattr(client, "build_error", ""), "接不上必须留下原因"
+
+
+def test_sys1_unknown_provider_is_reported():
+    from kernel.config import Config, Sys1Config
+    from kernel.sys1_jev import build_client
+
+    cfg = Config(sys1=Sys1Config(provider="openai_chat", model="x", base_url="http://127.0.0.1:1/v1"))
+    client = build_client(cfg)
+    assert "不认识的" in getattr(client, "build_error", "")
+
+
+def test_sys1_provider_typos_still_connect():
+    from kernel.config import Config, Sys1Config
+    from kernel.sys1_jev import build_client
+
+    for spelling in ("llm-fallback", "llm_fallback", "openai", "chat"):
+        client = build_client(
+            Config(
+                sys1=Sys1Config(
+                    provider=spelling, base_url="http://127.0.0.1:1/v1", model="m"
+                )
+            )
+        )
+        assert client.name.startswith("llm_fallback"), spelling

@@ -150,6 +150,7 @@ class MemoryStore:
             vis = list(dict.fromkeys([source_id, *about]))
         ts = created_at or iso()
         node = MemoryNode(
+            base_importance=importance,
             id=self.content_id(
                 kind=kind,
                 lod0=lod0,
@@ -372,8 +373,11 @@ class MemoryStore:
             return None
         node.last_accessed = iso()
         node.access_count += 1
-        # 间隔重复式强化：每次被成功召回，权重向上限靠拢
-        node.importance = min(1.0, node.importance + 0.02)
+        # 间隔重复式强化：每次被成功召回，权重向上限靠拢——
+        # 但强化只允许在“事件本身的重要性”之上 +0.12，否则一条被反复召回的
+        # 闲话会靠次数爬到 0.97，把真正重要的事挤下地貌。
+        ceiling = min(1.0, float(node.base_importance or node.importance) + 0.12)
+        node.importance = min(ceiling, node.importance + 0.02)
         node.updated_at = iso()
         self._write_node(node)
         return node

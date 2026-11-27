@@ -21,6 +21,13 @@ from kernel.claims import Claim, extract_claims, is_correction
 from kernel.config import Config
 from kernel.evolution import Evolver
 from kernel.git_ledger import GitLedger
+from kernel.memtext import (
+    is_richer,
+    looks_like_placeholder,
+    looks_like_state_echo,
+    mem_key,
+    same_fact,
+)
 from kernel.models import (
     AppliedActions,
     FocusUpdate,
@@ -202,8 +209,18 @@ class Heartbeat:
             auto_continue = bool(next_carried) and not fresh and not wants_continue
             if not progress or not (wants_continue or auto_continue):
                 break
-            if tick >= self.max_chain_ticks:
-                halted = f"达到 MAX_CHAIN_TICKS={self.max_chain_ticks} 硬熔断"
+            tick_cap = self.max_chain_ticks
+            cap_note = f"MAX_CHAIN_TICKS={tick_cap}"
+            if event.kind == "wake":
+                # 自主唤醒没人等着听：连锁思考只在她真有事跟进时才有价值
+                wake_cap = int(
+                    getattr(self.config.budget, "max_wake_chain_ticks", 1) or 1
+                )
+                if wake_cap < tick_cap:
+                    tick_cap = wake_cap
+                    cap_note = f"MAX_WAKE_CHAIN_TICKS={wake_cap}（自主唤醒不自转）"
+            if tick >= tick_cap:
+                halted = f"达到 {cap_note} 硬熔断"
                 break
             if budget_sec is not None and (time.monotonic() - started) >= budget_sec:
                 halted = f"单轮思考超过 {budget_sec:.0f}s 预算，先收尾（可改 [budget] max_chain_seconds）"
@@ -215,7 +232,9 @@ class Heartbeat:
             carried = next_carried
             tick += 1
 
-        if event.kind == "wake" or says or monologues:
+        # 轮次 = 一次交流。自主唤醒如果只是脑子里过了一遍（没有 say），
+        # 就不该在账本里留下“等待下一拍”的空壳——它会污染近况，还会被反复召回。
+        if says or (event.kind != "wake" and monologues):
             self._record_turn(event, says, monologues)
         result.halted_reason = halted
         return result
@@ -622,8 +641,8 @@ class Heartbeat:
 
     @staticmethod
     def _mem_key(text: str) -> str:
-        """去重用的骨架：去掉标点与“吃得了的着了”这类不改变事实的字。"""
-        return re.sub(r"[\s，。、：；！？,.:;!?（）()\[\]【】…—\-~\"'“”‘’吃得了的着了]", "", text).lower()
+        """历史调用点；判据统一在 ``kernel.memtext.mem_key``。"""
+        return mem_key(text)
 
     def _near_duplicate(self, event: Event, lod0: str, about: Sequence[str]):
         """找一条“几乎一样”的旧记忆：同一件事不该每次都长出一个新文件。"""
@@ -636,9 +655,7 @@ class Heartbeat:
                 return node
             if about and not (set(node.about_ids) & set(about)):
                 continue
-            if similarity(node.lod0, lod0) >= 0.85:
-                return node
-            if similarity(self._mem_key(node.lod0), self._mem_key(lod0)) >= 0.85:
+            if same_fact(node.lod0, lod0):
                 return node
         return None
 
@@ -649,6 +666,21 @@ class Heartbeat:
         if not lod0:
             actions.errors.append("memorize：lod0 不能为空")
             return
+        if looks_like_placeholder(lod0):
+            actions.notes.append(
+                f"记忆被拒：lod0 是占位符或数字（{lod0[:12]!r}），不是事实"
+            )
+            return
+        if looks_like_state_echo(lod0):
+            actions.notes.append(f"记忆被拒：这是社交状态回显，不是事件（{lod0[:16]}…）")
+            return
+        for field_name in ("lod1", "lod2"):
+            raw_field = str(op.get(field_name) or "").strip()
+            if raw_field and looks_like_placeholder(raw_field):
+                op[field_name] = lod0
+                actions.notes.append(
+                    f"记忆清洗：{field_name} 是数字/占位符（{raw_field[:8]!r}），已用 lod0 替代"
+                )
         about = [str(x) for x in (op.get("about_ids") or op.get("about") or [])] or [
             event.speaker_id
         ]
@@ -677,14 +709,19 @@ class Heartbeat:
 
         duplicate = self._near_duplicate(event, lod0, about)
         if duplicate is not None:
-            self.store.touch(duplicate.id)
-            self.store.set_importance(
-                duplicate.id, min(0.95, duplicate.importance + 0.05)
-            )
-            actions.notes.append(
-                f"记忆去重：已经记过「{one_line(lod0, 24)}」（#{duplicate.id}），没有重复新建"
-            )
-            return
+            if is_richer(lod0, duplicate.lod0):
+                # 同一件事写得更全：新版本留下，旧版本归档（文件与账本都还在）
+                self.store.archive(duplicate.id)
+                actions.notes.append(
+                    f"记忆升级：「{one_line(duplicate.lod0, 20)}」→"
+                    f"「{one_line(lod0, 24)}」（旧版已归档）"
+                )
+            else:
+                self.store.touch(duplicate.id)
+                actions.notes.append(
+                    f"记忆去重：已经记过「{one_line(lod0, 24)}」（#{duplicate.id}），没有重复新建"
+                )
+                return
 
         node = self.store.put(
             lod0=lod0,
@@ -756,9 +793,8 @@ class Heartbeat:
         old = str(profile.get("display_name") or speaker)
         if old == value:
             return
-        if not correction and old not in {"主人", speaker} and similarity(old, value) < 0.4:
-            # 不是纠错语气、但称呼确实变了：也照改，只是留下更明确的痕迹
-            pass
+        if correction:
+            actions.notes.append("（听出这是纠错语气，旧称呼一并作废）")
         self.relations.update(speaker, {"display_name": value})
         if speaker not in actions.relation_updates:
             actions.relation_updates.append(speaker)
@@ -792,6 +828,13 @@ class Heartbeat:
         }
         template, importance, tags = templates[claim.kind]
         lod0 = template.format(value=claim.value)
+        if claim.kind in {"like", "dislike"}:
+            # “我改口味了”：同一件东西的相反偏好作废，否则她会同时相信两种
+            removed = self._retract_opposite(claim.kind, claim.value, speaker)
+            if removed:
+                actions.notes.append(
+                    f"作废 {removed} 条相反的旧偏好（现在按「{lod0}」记）"
+                )
         duplicate = self._near_duplicate(event, lod0, [speaker])
         if duplicate is not None:
             self.store.touch(duplicate.id)
@@ -810,6 +853,34 @@ class Heartbeat:
         )
         actions.memorized.append(node.id)
         actions.notes.append(f"事实入账：{lod0}")
+
+    _LIKE_WORDS = ("喜欢", "偏爱", "偏好", "钟爱", "爱吃", "爱")
+    _DISLIKE_WORDS = ("不喜欢", "讨厌", "受不了", "不爱", "不吃")
+
+    def _retract_opposite(self, kind: str, value: str, speaker: str) -> int:
+        item = self._mem_key(value)
+        if len(item) < 2:
+            return 0
+        opposite = self._DISLIKE_WORDS if kind == "like" else self._LIKE_WORDS
+        removed = 0
+        try:
+            nodes = self.store.list_nodes(speaker, limit=500)
+        except Exception:  # noqa: BLE001
+            return 0
+        item_chars = set(item)
+        for node in nodes:
+            text = node.lod0
+            if not any(word in text for word in opposite):
+                continue
+            if kind == "dislike" and any(word in text for word in self._DISLIKE_WORDS):
+                continue  # 已经是“不喜欢”，不用再作废
+            # 只作废“同一件东西”的偏好：物品词必须落在旧记忆里
+            key = set(self._mem_key(text))
+            if len(item_chars & key) / max(1, len(item_chars)) < 0.8:
+                continue
+            if self.store.archive(node.id):
+                removed += 1
+        return removed
 
     def _retract_name_memories(
         self, speaker: str, keep: str, actions: AppliedActions

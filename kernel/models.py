@@ -152,6 +152,9 @@ class MemoryNode:
     epistemic: str = "direct"
     visibility: list[str] = field(default_factory=list)
     importance: float = 0.6
+    #: 写入时判定的“事件重要性”。召回强化只在它之上小幅浮动，
+    #: 否则被反复召回的一句闲话会爬到 0.97，把真正重要的事挤下地貌。
+    base_importance: float = 0.0
     pinned: bool = False
     tags: list[str] = field(default_factory=list)
     emotion: dict[str, Any] = field(default_factory=dict)
@@ -180,6 +183,8 @@ class MemoryNode:
         if not self.visibility:
             self.visibility = list(dict.fromkeys([self.source_id, *self.about_ids]))
         self.importance = clamp(float(self.importance), 0.0, 1.0)
+        if not self.base_importance:
+            self.base_importance = self.importance
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -193,6 +198,7 @@ class MemoryNode:
             "epistemic": self.epistemic,
             "visibility": list(self.visibility),
             "importance": round(float(self.importance), 6),
+            "base_importance": round(float(self.base_importance), 6),
             "pinned": bool(self.pinned),
             "tags": list(self.tags),
             "emotion": dict(self.emotion),
@@ -218,6 +224,9 @@ class MemoryNode:
             epistemic=str(d.get("epistemic", "direct")),
             visibility=list(d.get("visibility") or []),
             importance=float(d.get("importance", 0.6)),
+            base_importance=float(
+                d.get("base_importance", d.get("importance", 0.6))
+            ),
             pinned=bool(d.get("pinned", False)),
             tags=list(d.get("tags") or []),
             emotion=dict(d.get("emotion") or {}),

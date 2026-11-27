@@ -171,6 +171,8 @@ class BudgetConfig:
     # 一轮外部事件内，连环思考允许花掉的总墙钟时间（秒）。本地 4B 一拍就 15~40s，
     # 没有这个刹车就会出现“她没有输入窗口、你只能干等”的长时间自转。
     max_chain_seconds: int = 60
+    # 自主唤醒触发的连环思考上限（默认 1：没人等着听，就别自转）
+    max_wake_chain_ticks: int = 1
     # 自主唤醒的最短预约间隔（秒）：模型常写 after_sec=0..5，会把对话变成自激循环
     min_wake_sec: int = 30
     # 每小时允许的自主唤醒（schedule_wake 真正触发）配额
@@ -189,6 +191,9 @@ class BudgetConfig:
             section_event=_as_int(d.get("section_event"), cls.section_event),
             max_chain_ticks=_as_int(d.get("max_chain_ticks"), cls.max_chain_ticks),
             max_chain_seconds=_as_int(d.get("max_chain_seconds"), cls.max_chain_seconds),
+            max_wake_chain_ticks=_as_int(
+                d.get("max_wake_chain_ticks"), cls.max_wake_chain_ticks
+            ),
             min_wake_sec=_as_int(d.get("min_wake_sec"), cls.min_wake_sec),
             max_proactive_per_hour=_as_int(
                 d.get("max_proactive_per_hour"), cls.max_proactive_per_hour

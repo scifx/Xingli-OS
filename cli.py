@@ -16,6 +16,7 @@
     /sys1 on <模型>   用本地决策模型当丘脑（立刻生效，并写进 xingli.toml）
     /sys1 off         退回本地词法
     /forget <id>      作废一条记忆（只归档，文件与账本都留着）
+    /tidy [dry]        存量记忆卫生：归档占位符/状态回显，合并同一事实的重复，修 LOD 字段
     /status            端点连通性、模型、Token 预算与记忆统计
     /as <speaker_id>   切换当前说话人（测试隐私墙与社交反哺）
     /who               当前说话人与其关系档案
@@ -131,18 +132,18 @@ class ChatCLI:
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
-    def _serialized(self, fn, *args):
+    def _serialized(self, fn, *args, **kwargs):
         with self._lock:
-            return fn(*args)
+            return fn(*args, **kwargs)
 
-    async def _call(self, fn, *args):
+    async def _call(self, fn, *args, **kwargs):
         """在守护线程里跑阻塞调用：按 Ctrl-C 时不必等 HTTP 请求收尾。"""
         loop = asyncio.get_running_loop()
         future = loop.create_future()
 
         def runner() -> None:
             try:
-                result = fn(*args)
+                result = fn(*args, **kwargs)
             except BaseException as exc:  # noqa: BLE001 - 交回事件循环
                 loop.call_soon_threadsafe(future.set_exception, exc)
             else:
@@ -257,6 +258,8 @@ class ChatCLI:
     # ------------------------------------------------------------------
     async def run(self) -> None:
         print(BANNER)
+        for notice in SYS1_NOTICES:
+            print(notice)
         print(self._banner_context())
         self.pump = _InputPump()
         self.pump.start()
@@ -271,12 +274,20 @@ class ChatCLI:
                 if not line:
                     continue
                 if line.startswith("/"):
-                    await self._command(line)
+                    await self._safe_command(line)
                     continue
                 await self._turn(line)
         finally:
             self.running = False
             poller.cancel()
+
+    async def _safe_command(self, line: str) -> None:
+        try:
+            await self._command(line)
+        except Exception as exc:  # noqa: BLE001 - 指令写错了也不该掀翻聊天
+            print(f"⟨指令出错⟩ {type(exc).__name__}: {exc}")
+            if os.environ.get("XINGLI_TRACEBACK"):
+                traceback.print_exc()
 
     # ------------------------------------------------------------------
     def _interrupt(self) -> bool:
@@ -315,9 +326,9 @@ class ChatCLI:
             await asyncio.sleep(0.05)
         return None
 
-    async def _run_call(self, fn, *args):
+    async def _run_call(self, fn, *args, **kwargs):
         """跑一次阻塞调用，同时保持输入可读（并把插话变成刹车信号）。"""
-        task = asyncio.create_task(self._call(self._serialized, fn, *args))
+        task = asyncio.create_task(self._call(self._serialized, fn, *args, **kwargs))
         while True:
             done, _ = await asyncio.wait({task}, timeout=0.25)
             self._absorb_input()
@@ -361,7 +372,9 @@ class ChatCLI:
         if cfg.sys1.provider == "local" or not cfg.sys1.base_url:
             body += "（本地词法；想用本地决策模型：/sys1 on Kev-4B-GGUF）"
         elif "->" not in name:
-            body += "  ⚠ 配置了端点但没能接上，已退回本地词法（/sys1 看原因）"
+            reason = getattr(client, "build_error", "")
+            body += "  ⚠ 配置了端点但没能接上，已退回本地词法"
+            body += f"：{reason}" if reason else "（/sys1 看原因）"
         else:
             body += f"  ← {cfg.sys1.base_url}（{cfg.sys1.model or '?'}，{cfg.sys1.timeout_sec}s）"
         return body
@@ -638,6 +651,23 @@ class ChatCLI:
                 print("用法：/prefill on|off")
         elif cmd == "/sys1":
             await self._sys1_command(arg)
+        elif cmd == "/tidy":
+            from memory.hygiene import tidy
+
+            dry = arg.strip().lower() in {"dry", "check", "preview"}
+            baseline = viewer.snapshot(self.ws.cortex) if self.show_memory else None
+            report = await self._call(
+                self._serialized, tidy, self.hb.store, self.speaker, archive=not dry
+            )
+            print(("（预演，不改动）" if dry else "") + report.summary())
+            for line in report.lines():
+                print(f"  {line}")
+            if not dry and report.changed:
+                change = self._memory_change(baseline)
+                if change:
+                    print()
+                    for line in change.splitlines():
+                        print(f"  │ {line}")
         elif cmd == "/forget":
             node = self.hb.store.get(arg) if arg else None
             if node is None or not self.hb.store.is_visible(node, self.speaker):
@@ -810,11 +840,39 @@ def write_config(
     return target
 
 
+#: 一次性提示（在启动时打印，告诉你 sys1 为什么没生效）
+SYS1_NOTICES: list[str] = []
+
+
+def _maybe_promote_sys1(cfg: Config) -> Config:
+    """`[sys1] model` 填了、provider 却还是 local —— 这是最常见的“我明明配了”的场景。
+
+    这种配置没有歧义：写了模型名就是想让它当丘脑。直接升格成 llm_fallback 并明说，
+    接不上时 ChainClient 会自己退回本地词法，不会把聊天卡死。
+    """
+    model = (cfg.sys1.model or "").strip()
+    if cfg.sys1.provider != "local" or not model:
+        return cfg
+    base = (cfg.sys1.base_url or cfg.sys2.base_url or "").strip()
+    if not base:
+        SYS1_NOTICES.append(
+            f"⚠ 你填了 [sys1] model = {model!r}，但没有 base_url，丘脑只能用本地词法"
+        )
+        return cfg
+    SYS1_NOTICES.append(
+        f"System One 自动接管：provider=local 但 model={model!r} 已填 → 按 llm_fallback 使用"
+        f"（接不上会自动退回本地词法；想关掉就把 model 清空）"
+    )
+    return cfg.with_sys1(provider="llm_fallback", base_url=base)
+
+
 def _prepare(args) -> tuple[Workspace, Config, str]:
     root = Path(args.root).resolve() if args.root else Path.cwd()
     cfg = Config.load(path=args.config, root=root)
     if args.mock:
         cfg = cfg.with_sys2(provider="mock")
+    else:
+        cfg = _maybe_promote_sys1(cfg)
     ws = Workspace.open(root, cfg)
     used = args.config or os.environ.get("XINGLI_CONFIG")
     if not used:
@@ -991,6 +1049,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--as", dest="speaker", default="owner", help="初始说话人 id")
     parser.add_argument("--say", help="非交互：只说一句话后退出")
     parser.add_argument("--sleep", action="store_true", help="非交互：跑一次睡眠整合")
+    parser.add_argument(
+        "--tidy",
+        action="store_true",
+        help="非交互：整理存量记忆（归档占位符/状态回显，合并重复），打印报告后退出",
+    )
     parser.add_argument("--show-memory", action="store_true", help="非交互时也打印记忆变化")
     parser.add_argument("--show-thought", action="store_true", help="非交互时打印内心 OS")
     parser.add_argument("--ping", action="store_true", help="只探测 System Two 端点后退出")
@@ -1058,6 +1121,14 @@ def main(argv: list[str] | None = None) -> int:
         print("提示：加 --mock 用离线大脑跑通流程；或运行 python cli.py --init-config。", file=sys.stderr)
         return 2
 
+    if args.tidy:
+        from memory.hygiene import tidy
+
+        report = tidy(hb.store, args.speaker)
+        print(report.summary())
+        for line in report.lines():
+            print(f"  {line}")
+        return 0 if not report.errors else 1
     if args.sleep:
         print(hb.sleep().summary())
         return 0

@@ -38,9 +38,12 @@ SYSTEM_CONTRACT = """你是「星璃」。你不是在复述聊天记录，而�
 3. emotion_delta: {"维度": 增量}（单次 |增量| ≤ 0.2）
 4. memory_ops: [{"op":"recall","mem_id":"..."} | {"op":"recall_turn","turn_id":12} |
    {"op":"search_memory","query":"...","limit":5} |
-   {"op":"memorize","lod0":"...","lod1":"...","lod2":"...","kind":"episode",
-    "about_ids":[],"visibility":[],"epistemic":"direct|hearsay|inferred",
-    "importance":0.6,"tags":[],"pinned":false}]
+   {"op":"memorize","lod0":<str:一句话事实>,"lod1":<str:两三句要点>,"lod2":<str:当时的原话>,
+    "kind":"episode","about_ids":[],"visibility":[],"epistemic":"direct|hearsay|inferred",
+    "importance":0.6,"tags":[],"pinned":false} |
+   {"op":"forget","mem_id":"..."}]
+   lod0/lod1/lod2 都是**文本字符串**（不是分数、不是数字）；只记事实与事件，不要记你自己的内部状态
+   （亲密度/信任值这类回显不算记忆）。
 5. relation_ops: [{"person_id":"...","intimacy":0.8,"global_trust":0.9,"domain_trust":{"tech_opinion":0.7},"custom":{}}]
 6. say: "对当前说话人说的话" | {"to":"人物id","text":"..."} | null（null / 空串 = 这一拍沉默或继续思考）
 7. wake: {"continue_think":{"reason":"..."}|null, "schedule_wake":{"after_sec":600,"reason":"...","target_speaker":"owner"}|null}
@@ -74,7 +77,7 @@ SYSTEM_CONTRACT_COMPACT = """你是「星璃」。你在一帧极短的世界快
 字段（按此顺序，其余可省略）：
 1. inner_monologue: 第一人称内心 OS（先想清楚）
 2. say: 对当前说话人说的话 | ""（沉默；被问到你是谁时用第一人称讲清你自己）
-3. memory_ops: [{"op":"recall","mem_id":"..."} | {"op":"recall_turn","turn_id":1} | {"op":"search_memory","query":"..."} | {"op":"memorize","lod0":"...","lod1":"...","lod2":"...","epistemic":"direct|hearsay","visibility":["owner"],"importance":0.6}]
+3. memory_ops: [{"op":"recall","mem_id":"..."} | {"op":"recall_turn","turn_id":1} | {"op":"search_memory","query":"..."} | {"op":"memorize","lod0":<一句话事实>,"lod1":<两三句要点>,"lod2":<原话>,"epistemic":"direct|hearsay","visibility":["owner"],"importance":0.6} | {"op":"forget","mem_id":"..."}]  （lod 三个字段都是文本，不是数字；不要记内部状态回显）
 4. focus_update: {"turn_id":0,"decay_before":0.35,"decay_after":0.2,"pin":[],"unpin":[]} | null
 5. emotion_delta: {"warmth":0.05} | {}
 6. wake: {"continue_think":{"reason":"..."}|null,"schedule_wake":null}
@@ -179,9 +182,12 @@ def looks_like_json_attempt(text: str) -> bool:
 
 
 MEMORY_EXTRACT_SYSTEM = (
-    "你是记忆抽取器。只输出一个 JSON 对象，不要解释、不要叙述过程：\n"
-    '{"memory_ops":[{"op":"memorize","lod0":"一句话","lod1":"两三句要点",'
-    '"lod2":"原话","importance":0.6,"tags":[]}]}\n'
+    "你是记忆抽取器。只输出一个 JSON 对象，不要解释、不要叙述过程。\n"
+    "格式：{\"memory_ops\":[{\"op\":\"memorize\",\"lod0\":<一句话事实>,"
+    "\"lod1\":<两三句要点>,\"lod2\":<对方当时的原话>,"
+    "\"importance\":0.6,\"tags\":[]}]}\n"
+    "lod0/lod1/lod2 必须是**具体内容文本**：不要输出“一句话/两三句要点/原话”这类格式说明，"
+    "也不要输出数字。\n"
     "只抽取值得长期记住的东西：偏好、计划、约定、边界、称呼、身体状况。"
     '没有就输出 {"memory_ops": []}。'
 )

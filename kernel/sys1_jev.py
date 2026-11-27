@@ -463,19 +463,58 @@ class ChainClient:
         return result
 
 
+#: 常见写法都认：用户写 llm-fallback / openai / chat 都当成 llm_fallback
+_PROVIDER_ALIASES = {
+    "llm": "llm_fallback",
+    "fallback": "llm_fallback",
+    "llm-fallback": "llm_fallback",
+    "llmfallback": "llm_fallback",
+    "openai": "llm_fallback",
+    "openai_compatible": "llm_fallback",
+    "openai-chat": "llm_fallback",
+    "chat": "llm_fallback",
+    "chat_completions": "llm_fallback",
+    "lexicon": "local",
+    "off": "local",
+    "none": "local",
+}
+
+
+def _normalize_provider(provider: str) -> str:
+    value = (provider or "").strip().lower()
+    return _PROVIDER_ALIASES.get(value, value)
+
+
 def build_client(config: Config) -> Sys1Client:
+    """按配置造丘脑；接不上时**把原因留在 client 上**，不要静默消失。
+
+    以前这里 `except Sys1Error: return local`，于是“我明明配了模型却没生效”
+    在界面上完全看不出来。现在退回本地词法时会带上 ``build_error``，
+    CLI 的 banner / `/sys1` 会把它原样打出来。
+    """
     local = LocalLexiconClient()
-    provider = config.sys1.provider
+    provider = _normalize_provider(config.sys1.provider)
+    attempts: list[tuple[str, Any]] = []
     if provider in {"jev", "openai_decisions"}:
+        attempts.append(("jev", HttpDecisionClient))
+    elif provider == "llm_fallback":
+        attempts.append(("llm_fallback", LLMFallbackClient))
+    elif provider not in {"local", ""}:
+        local.build_error = (
+            f"不认识的 [sys1] provider = {provider!r}（可选 local / llm_fallback / jev）"
+        )
+        return local
+    for _name, factory in attempts:
         try:
-            return ChainClient(HttpDecisionClient(config.sys1), local)
-        except Sys1Error:
+            return ChainClient(factory(config.sys1), local)
+        except Sys1Error as exc:
+            local.build_error = f"{provider} 初始化失败：{exc}"
             return local
-    if provider == "llm_fallback":
-        try:
-            return ChainClient(LLMFallbackClient(config.sys1), local)
-        except Sys1Error:
-            return local
+    if config.sys1.model and not config.sys1.base_url:
+        local.build_error = (
+            f"配了 model={config.sys1.model!r} 但 [sys1] base_url 是空的，"
+            "所以丘脑退回本地词法；补上 base_url，或在聊天里 /sys1 on <模型>"
+        )
     return local
 
 

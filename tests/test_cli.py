@@ -183,3 +183,45 @@ def test_read_line_drains_queue_in_order(tmp_path: Path, monkeypatch, capsys):
     assert chat._interrupt() is False
     chat.queue.append("插话")
     assert chat._interrupt() is True
+
+
+def test_tidy_command_cleans_polluted_memory(tmp_path: Path, monkeypatch, capsys):
+    """`/tidy` 在聊天里可用：预演不改动，真跑归档垃圾与重复。"""
+    import asyncio
+    import json
+
+    from kernel.boot import Heartbeat
+    from kernel.paths import Workspace
+    from kernel.sys2_llm import MockSys2Client
+    from memory.store import MemoryStore
+
+    root = tmp_path / "ws"
+    cfg = Config.load(root=root)
+    ws = Workspace.open(root, cfg)
+    ws.episodes.mkdir(parents=True, exist_ok=True)
+    for node_id, lod0 in (("aaa", "一句话"), ("bbb", "主人喜欢菠萝和芒果"), ("ccc", "主人偏好菠萝与芒果")):
+        payload = {
+            "id": node_id, "kind": "episode", "lod0": lod0, "lod1": "0.85", "lod2": "0.7",
+            "source_id": "owner", "about_ids": ["owner"], "epistemic": "direct",
+            "visibility": ["owner"], "importance": 0.6, "pinned": False, "tags": [],
+            "emotion": {}, "refs": [], "created_at": "2026-11-27T00:00:00+00:00",
+            "updated_at": "2026-11-27T00:00:00+00:00",
+            "last_accessed": "2026-11-27T00:00:00+00:00", "access_count": 0,
+            "archived": False, "schema_version": 1,
+        }
+        (ws.episodes / f"{node_id}.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    store = MemoryStore(ws)
+    store.reindex()
+
+    hb = Heartbeat.create(ws, cfg, sys2=MockSys2Client())
+    chat = cli.ChatCLI(hb, ws)
+    asyncio.run(chat._command("/tidy dry"))
+    assert "预演" in capsys.readouterr().out
+    assert len(store.list_nodes("owner")) == 3
+
+    asyncio.run(chat._command("/tidy"))
+    out = capsys.readouterr().out
+    assert "归档垃圾 1 条" in out and "合并重复 1 条" in out
+    live = store.list_nodes("owner")
+    assert len(live) == 1
+    assert live[0].lod1 == live[0].lod0
