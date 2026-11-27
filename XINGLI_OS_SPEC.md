@@ -360,5 +360,9 @@ $\text{Sys2}_\theta$ 默认通过**结构化 JSON 输出（Structured Output / `
 60 秒断路器，端点挂掉时自动退回本地词法而不拖慢每一拍。CLI 提供
 `--init-config / --ping / --selftest`，`--selftest` 会真跑一轮并打印新建的记忆文件。
 行动契约有 `full` / `compact` 两个版本（字段与语义相同，只改措辞与示例长度），供小模型使用。
+结构化输出走 `json_schema → json_object → off` 的降级阶梯（llama.cpp 会把 schema 转成 GBNF）；
+模型完全不守契约时按「纯发言」降级（照常说话与记轮次，但该拍没有记忆/进化动作，显式标注）。
+另外补了一处 SPEC 没写的必要件：`cortex/persona.py` 的自我认知/准则/性格被压成恒定「身份块」
+放在 system 最前，否则底座模型不知道自己是谁。
 
 **仍未验证**：真实底座模型的表达质量、真实 Jev / Decisions 端点的语义准确率、任何 benchmark。

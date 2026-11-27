@@ -16,12 +16,34 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Any
 
 from kernel.jsonx import strip_fences
 from kernel.models import ThoughtPacket
+
+
+#: 代码载荷的“指纹”：有这些才当成 Python，否则当成纯发言
+_CODE_HINT = re.compile(
+    r"\b(def|class|import|return|lambda|yield)\b"
+    r"|__\w+__"
+    r"|[A-Za-z_][\w\.]*\s*\("
+    r"|^\s*[A-Za-z_]\w*\s*=\s*[^=]",
+    re.MULTILINE,
+)
+
+PROSE_WARNING = (
+    "模型输出既不是 JSON 认知包也不是代码，已按「纯发言」降级：这一拍能说话，"
+    "但没有记忆/进化动作。排查顺序：--fast（compact 契约）→ "
+    "xingli.toml 里 contract_in_user = true → 端点是否支持 json_schema → 换 instruct 模型。"
+)
+
+
+def looks_like_code(text: str) -> bool:
+    """粗判一段文本是不是代码载荷（避免把中文散文当 Python 去 audit）。"""
+    return bool(_CODE_HINT.search(text or ""))
 
 
 class CodeRejected(PermissionError):
@@ -434,6 +456,14 @@ def parse_thought_output(raw: str, speaker_id: str = "owner") -> tuple[ThoughtPa
         if not isinstance(data, dict):
             return ThoughtPacket(parse_warnings=["JSON 顶层不是对象"]), "empty"
         return ThoughtPacket.from_dict(data), "json"
+
+    if not looks_like_code(text):
+        # 散文：不自欺地“解析”，但也不装死——降级成纯发言，并把降级写进诊断
+        flat = re.sub(r"\s+", " ", text).strip()
+        return (
+            ThoughtPacket(say=flat[:600], parse_warnings=[PROSE_WARNING]),
+            "prose",
+        )
 
     builder = PacketBuilder(speaker_id=speaker_id)
     ok, detail = execute_python(text, builder)

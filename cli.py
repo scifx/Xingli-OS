@@ -77,11 +77,27 @@ class ChatCLI:
         self.show_thought = True
         self.show_memory = show_memory
         self.config_path = config_path
+        self.mode_stats: dict[str, int] = {}
         self.running = True
         # 单线程执行器：聊天与自主唤醒排队执行，避免并发写记忆
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xingli")
 
     # ------------------------------------------------------------------
+    def _gen_stats(self) -> tuple[float | None, int | None]:
+        timings = getattr(self.hb.sys2, "last_timings", None) or {}
+        usage = getattr(self.hb.sys2, "last_usage", None) or {}
+        rate = timings.get("predicted_per_second")
+        generated = timings.get("predicted_n") or usage.get("completion_tokens")
+        return (
+            float(rate) if isinstance(rate, (int, float)) else None,
+            int(generated) if isinstance(generated, (int, float)) else None,
+        )
+
+    def _count_modes(self, result) -> None:
+        for tick in result.ticks:
+            if tick.mode:
+                self.mode_stats[tick.mode] = self.mode_stats.get(tick.mode, 0) + 1
+
     def _memory_change(self, baseline, *, limit: int = 6) -> str:
         if not self.show_memory or baseline is None:
             return ""
@@ -117,10 +133,19 @@ class ChatCLI:
         if self.show_thought and result.ticks:
             last = result.ticks[-1]
             total_ms = sum(t.duration_ms for t in result.ticks)
+            rate, generated = self._gen_stats()
+            extra = f" · 出 {generated} tok" if generated else ""
+            extra += f" · {rate:.1f} tok/s" if rate else ""
             print(
                 f"  ⟨计时⟩ {total_ms / 1000:.1f}s · {len(result.ticks)} 拍 · "
-                f"帧 {last.frame_tokens} tokens"
+                f"帧 {last.frame_tokens} tokens{extra}"
             )
+            for tick in result.ticks:
+                if tick.mode and tick.mode != "json":
+                    print(
+                        f"  ⟨降级⟩ 第 {tick.tick} 拍输出为「{tick.mode}」："
+                        "本拍能说话，但记忆/进化动作被跳过"
+                    )
         change = self._memory_change(baseline)
         if change:
             for line in change.splitlines():
@@ -140,6 +165,7 @@ class ChatCLI:
             for result in results:
                 reason = result.event.extra.get("reason", "")
                 print(f"\n（星璃主动开口 · {reason or '自主唤醒'}）")
+                self._count_modes(result)
                 self._print_result(result, baseline)
             await asyncio.sleep(0.5)
 
@@ -182,6 +208,7 @@ class ChatCLI:
                     continue
                 finally:
                     self._clear_hint()
+                self._count_modes(result)
                 self._print_result(result, baseline)
         finally:
             self.running = False
@@ -285,8 +312,26 @@ class ChatCLI:
                 print(f"  ⚠ 断路器打开：{client.last_error}")
             print(
                 f"预算：帧 {cfg.budget.frame_tokens} · 连环 {cfg.budget.max_chain_ticks} 拍 · "
-                f"契约 {cfg.sys2.contract}"
+                f"契约 {cfg.sys2.contract} · 结构化输出 {cfg.sys2.structured_output}"
             )
+            frame = self.hb.last_frame
+            if frame:
+                from kernel.textutil import estimate_tokens
+
+                print(
+                    f"系统提示：{estimate_tokens(frame.system)} tokens"
+                    f"（身份 {estimate_tokens(frame.identity)}）"
+                    f" · 帧末尾格式提醒 {cfg.sys2.contract_in_user}"
+                )
+            if self.mode_stats:
+                total = sum(self.mode_stats.values())
+                parts = "／".join(f"{k} {v}" for k, v in sorted(self.mode_stats.items()))
+                print(f"本会话输出形态：{parts}（共 {total} 拍）")
+                if self.mode_stats.get("json", 0) == 0 and total:
+                    print(
+                        "  ⚠ 还没有一次按 JSON 契约输出：先 /selftest 看建议，"
+                        "或换更守 JSON 的 instruct 模型"
+                    )
             print(json.dumps(self.hb.store.stats(self.speaker), ensure_ascii=False))
         elif cmd == "/as":
             if not arg:
@@ -310,9 +355,16 @@ class ChatCLI:
             if not frame:
                 print("（还没有产生认知帧）")
                 return
+            from kernel.textutil import estimate_tokens
+
             print(f"Token: {frame.total_tokens} / 预算 {self.hb.config.budget.frame_tokens}")
+            print(
+                f"  系统（身份 {estimate_tokens(frame.identity)} + 契约 "
+                f"{estimate_tokens(frame.system) - estimate_tokens(frame.identity)}）"
+            )
             for name, tokens in frame.section_tokens.items():
                 print(f"  {name:<10} {tokens:>5}")
+            print("\n【身份块】\n" + (frame.identity or "（无）"))
             print("\n" + frame.user)
         elif cmd == "/focus":
             snap = self.hb.focus.snapshot(self.speaker)
@@ -399,8 +451,10 @@ repair = true                 # 输出不是 JSON 时追加一次“只要 JSON�
 retries = 1
 timeout_sec = 300             # CPU 推理一帧可能要几十秒
 temperature = 0.7
-max_tokens = 1400
+max_tokens = {max_tokens}
 contract = "{contract}"      # full（默认）| compact（小模型 / 上下文紧张）
+structured_output = "auto"    # auto: json_schema → json_object → 关；llama.cpp 会据此做语法约束
+# contract_in_user = true     # 某些模型的 chat template 会吞掉 system：在帧末尾再贴一次短提醒
 
 [sys1]
 provider = "{sys1_provider}"  # local（最快）| llm_fallback | jev | openai_decisions
@@ -428,6 +482,7 @@ def write_config(
     sys1_provider: str = "local",
     sys1_model: str = "",
     contract: str = "full",
+    max_tokens: int = 1000,
     path: Path | None = None,
 ) -> Path:
     target = path or (root / "xingli.toml")
@@ -442,6 +497,7 @@ def write_config(
             sys1_provider=sys1_provider,
             sys1_model=sys1_model or model,
             contract=contract,
+            max_tokens=max_tokens,
         ),
         encoding="utf-8",
     )
@@ -507,7 +563,17 @@ def _run_once(
         print("（这一轮她选择沉默；加 --show-thought 看内心 OS）")
     last = result.ticks[-1] if result.ticks else None
     tokens = last.frame_tokens if last else 0
-    print(f"⟨计时⟩ {elapsed:.1f}s · {len(result.ticks)} 拍 · 帧 {tokens} tokens")
+    rate = None
+    timings = getattr(hb.sys2, "last_timings", None) or {}
+    if isinstance(timings.get("predicted_per_second"), (int, float)):
+        rate = float(timings["predicted_per_second"])
+    print(
+        f"⟨计时⟩ {elapsed:.1f}s · {len(result.ticks)} 拍 · 帧 {tokens} tokens"
+        + (f" · {rate:.1f} tok/s" if rate else "")
+    )
+    for tick in result.ticks:
+        if tick.mode and tick.mode != "json":
+            print(f"⟨降级⟩ 输出为「{tick.mode}」：能说话，但本拍没有记忆/进化动作")
     if show_memory and baseline is not None:
         change = viewer.format_diff(
             viewer.diff(baseline, viewer.snapshot(ws.cortex)), ws.cortex, hb.store
@@ -547,11 +613,20 @@ def _selftest(root: Path, cfg: Config) -> int:
         print("  排查：端点是否在线 / model 名称是否正确 / max_tokens 是否太小 / 上下文长度是否够")
         return 2
     elapsed = time.monotonic() - started
-    modes = [t.packet and "ok" or "空包" for t in result.ticks]
+    modes = [t.mode or "空包" for t in result.ticks]
     print(f"\n✓ 端点返回，用时 {elapsed:.1f}s，{len(result.ticks)} 拍（{' / '.join(modes)}）")
     last = result.ticks[-1]
-    print(f"  认知帧：{last.frame_tokens} tokens（预算 {cfg.budget.frame_tokens}）")
-    print(f"  解析：{'JSON' if last.packet and last.packet.inner_monologue else '无 inner_monologue'}")
+    timings = getattr(hb.sys2, "last_timings", None) or {}
+    rate = timings.get("predicted_per_second")
+    rate_text = f" · 生成 {rate:.1f} tok/s" if isinstance(rate, (int, float)) else ""
+    print(f"  认知帧：{last.frame_tokens} tokens（预算 {cfg.budget.frame_tokens}）{rate_text}")
+    print(
+        "  解析："
+        + ("JSON 契约 ✓" if last.mode == "json" else f"{last.mode}（降级）")
+        + f" · 系统提示含身份块 {len(hb.last_frame.identity)} 字"
+        if hb.last_frame
+        else ""
+    )
     for tick in result.ticks:
         if tick.packet and tick.packet.inner_monologue:
             print(f"  内心 OS：{tick.packet.inner_monologue.splitlines()[0][:120]}")
@@ -561,6 +636,12 @@ def _selftest(root: Path, cfg: Config) -> int:
             print(f"  ⚠ 解析：{warn}")
     for say in result.says:
         print(f"  她说：{say[:160]}")
+    if last.mode != "json":
+        print(
+            "  建议：① 用 --fast 重跑（compact 契约 + 短输出）；② 若模型模板可能吞掉 system，"
+            "在 xingli.toml 里加 contract_in_user = true；③ 确认 llama.cpp 版本支持 json_schema；"
+            "④ 换更守 JSON 的 instruct 模型"
+        )
     if not result.says and not result.ticks[-1].actions.errors:
         print("  （没有 say：模型可能只写了 memory_ops，或返回了空字段）")
     change = viewer.format_diff(
@@ -601,6 +682,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=["full", "compact"],
         help="行动契约版本：compact 更适合 7B 级别 / 上下文紧张的本地模型",
     )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="本地小模型省时档：compact 契约 + max_tokens 700（--init-config 时生效）",
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve() if args.root else Path.cwd()
@@ -612,7 +698,8 @@ def main(argv: list[str] | None = None) -> int:
             args.model or "local-model",
             sys1_provider=args.sys1_provider,
             sys1_model=args.sys1_model,
-            contract=args.contract,
+            contract="compact" if args.fast else args.contract,
+            max_tokens=700 if args.fast else 1000,
             path=Path(args.config) if args.config else None,
         )
         print(f"已写入配置：{path}")

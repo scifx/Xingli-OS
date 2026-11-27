@@ -577,6 +577,8 @@ class TickReport:
     actions: AppliedActions = field(default_factory=AppliedActions)
     duration_ms: float = 0.0
     env: dict[str, Any] = field(default_factory=dict)
+    #: 输出形态：json（契约）/ prose（降级纯发言）/ code / empty
+    mode: str = ""
 
     def summary(self) -> str:
         return (

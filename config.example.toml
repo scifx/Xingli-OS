@@ -23,6 +23,8 @@ max_tokens = 1400
 timeout_sec = 300             # CPU 推理一帧可能要几十秒
 contract = "full"             # full | compact：7B 级别或上下文紧张时用 compact
 json_mode = true              # 端点不支持 response_format 时自动降级
+structured_output = "auto"    # json_schema（语法约束）→ json_object → 关
+# contract_in_user = true     # 若模型的 chat template 吞掉 system：在帧末尾再贴短提醒
 repair = true                 # 输出不是 JSON 时追加一次“只要 JSON”的修复请求
 retries = 1                   # 连接失败重试次数（降级重试不计入）
 # 额外字段原样并入请求体。若模型把预算全花在思考上导致 content 为空：
@@ -45,7 +47,8 @@ max_tokens = 300          # 仅 llm_fallback 用
 
 # ── 预算与硬熔断（铁律 6）────────────────────────────────────────────
 [budget]
-frame_tokens = 6000        # 认知帧 + 系统契约的总 Token 上限
+frame_tokens = 6000        # 认知帧 + 系统契约 + 身份块的总 Token 上限
+section_identity = 240     # “她是谁”这一块的预算（来自 cortex/persona.py）
 section_env = 700          # 各段初始预算（超出总预算时按优先级压缩）
 section_sys1 = 700
 section_focal = 2300

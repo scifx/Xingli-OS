@@ -232,12 +232,13 @@ class Heartbeat:
         packet, mode = parse_thought_output(raw, event.speaker_id)
         packet.parse_warnings.extend(scan.errors)
         report.packet = packet
+        report.mode = mode
         self.last_packet = packet
-        if mode == "empty" and packet.parse_warnings:
-            report.actions.errors.extend(packet.parse_warnings)
+        parse_errors = list(packet.parse_warnings) if mode in {"empty", "prose"} else []
 
         # 5) 应用（声明式字段 + 可选代码载荷）
         report.actions = self._apply(packet, event, scan)
+        report.actions.errors.extend(parse_errors)
         report.duration_ms = (time.monotonic() - start) * 1000
         return report
 

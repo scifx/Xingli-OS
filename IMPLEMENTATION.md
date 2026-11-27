@@ -8,7 +8,7 @@
 
 纯标准库 Python 实现了 M1–M4 的核心闭环：**认知帧 + 焦点双向 LOD + 结构化认知包（可选代码载荷）
 + System One 三段门控 + 物理隐私墙/信源溯源 + 受控自进化（AST 审计/子进程试跑/回归/Git 账本）
-+ 睡眠整合（蒸馏/衰减/反失忆抽查）**，并配有 96 个 pytest（其中 26 个打在本地假端点，验证真实协议路径）与一个 50 项机制的离线验证脚本。
++ 睡眠整合（蒸馏/衰减/反失忆抽查）**，并配有 105 个 pytest（其中 33 个打在本地假端点，验证真实协议路径）与一个 50 项机制的离线验证脚本。
 
 它**没有**验证的部分也写在明处：真实底座模型的表达质量、真实 Jev 端点的语义准确率、
 任何 benchmark 成绩。离线 `mock` 大脑是**确定性脚本**，只负责让管线可复现。
@@ -22,7 +22,7 @@
 python demo.py
 
 # 2) 自动化测试
-python -m pytest -q            # 96 passed
+python -m pytest -q            # 105 passed
 
 # 3) CLI 聊天台（离线）
 python cli.py --mock
@@ -134,6 +134,28 @@ python cli.py --selftest                                  # 4) 真跑一轮 + �
 + 生成（`max_tokens`，默认 1400）。所以 `llama-server -c` 至少 8192，建议 16384；
 只有 8K 上下文时把 `[budget] frame_tokens` 降到 4000 即可，LOD 会自动按预算降级。
 
+### 结构化输出：先语法约束，再退让
+
+`[sys2] structured_output`（默认 `auto`）是一条**降级阶梯**，每一级都实测过：
+
+```
+json_schema（llama.cpp 会转成 GBNF，语法上强制出合法 JSON）
+   └─ 端点 400 → json_object（只要求“是 JSON”）
+        └─ 还是 400 → off（纯提示词，再不行就降级成纯发言）
+```
+
+认知包的 Schema 在 `kernel/sys2_llm.py::THOUGHT_SCHEMA`，只要求 `inner_monologue` 与 `say`
+两个必填字段，其余可省——对 4B 级别的模型来说，“被语法逼着写合法 JSON”比“被请求写 JSON”
+可靠得多。
+
+**她是谁**：`cortex/persona.py` 的 `SELF_CONCEPT / VALUES / TRAITS` 会被压成一段恒定的
+「身份块」放在 system 提示最前面（约 250 tokens，不随对话增长）。这是实现时补的——
+SPEC 没写，但没有它，底座模型根本不知道自己叫星璃，更不会用第一人称讲自己。
+
+**降级但绝不装死**：如果模型输出既不是 JSON 也不是代码，内核按「纯发言」处理——
+`say` 照样上屏、轮次照样落盘，但这一拍没有记忆/进化动作，并在 `actions.errors` 与 CLI
+里显式标注 `⟨降级⟩`。修复请求只在“像写坏的 JSON”时发（纯散文不重发），省掉一整趟生成。
+
 ### 真实端点常见的毛病，客户端已经处理
 
 | 毛病 | 处理方式 | 配置 |
@@ -145,12 +167,19 @@ python cli.py --selftest                                  # 4) 真跑一轮 + �
 | 把 JSON 塞进 `reasoning_content`，`content` 为空 | 依次尝试 content / reasoning / text 通道 | 自动 |
 | 完全不肯输出 JSON | 追加一次“只输出 JSON、不要解释”的修复请求 | `repair = true` |
 | 连接抖动 | 重试一次（0.6s 退避） | `retries = 1` |
+| 干脆只说人话（4B 常见） | 降级为「纯发言」：照样说话/记轮次，但没有记忆与进化动作，显式标注 | 自动 + `⟨降级⟩` |
+| chat template 吞掉 system 消息 | 在帧末尾再贴一次 `[OUTPUT_FORMAT]` 短提醒 | `contract_in_user = true` |
 | 模型把预算花在思考上 | 用额外字段关掉思考模板 | `[sys2.extra_body] chat_template_kwargs = { enable_thinking = false }` |
 | 不按契约命名（`reply`/`monologue`/`memories`），或把包在外壳里 | 别名表 + 单层解包 + 单对象包成数组，并在 `parse_warnings` 里留下“降级记录” | `kernel/models.py::PACKET_ALIASES` |
 | 小模型跟不上长契约 | 换紧凑契约（683 → 327 tokens，字段与例子都更短） | `[sys2] contract = "compact"` |
 
-小模型建议 `--init-config --contract compact`：只改系统契约的措辞与示例长度，
-认知帧、记忆格式、安全边界完全不变——这是“模型能力适配”，不是“设计降级”。
+小模型建议 `--init-config --fast`：compact 契约（327 vs 683 tokens）+ 输出上限 700。
+只改提示词措辞与生成长度，认知帧、记忆格式、安全边界完全不变——这是“模型能力适配”，
+不是“设计降级”。
+
+**速度**：每轮结束都会打印 `⟨计时⟩ 54.9s · 1 拍 · 帧 815 tokens · 出 512 tok · 6.4 tok/s`。
+`出 N tok` 是模型实际生成的长度——如果它远大于 100，说明模型在“自由发挥”而不是按需作答
+（语法约束 + compact 契约能把它压下来）。生成速率由 llama.cpp 的 `timings` 直接读回。
 
 `--status` 会显示最近三条“适配记录”（例如“端点不支持 response_format，已改用提示词约束 JSON”），
 让你知道刚才悄悄降级了什么，而不是假装一切正常。
@@ -354,6 +383,7 @@ score = 0.40·语义相似 + 0.20·时间近度(半衰 7 天) + 0.25·重要度
 | Sys1 `llm_fallback` 解析 / 降级 / 断路器打开与恢复 | `tests/test_sys1_http.py`（6 项） |
 | `--init-config` / `--ping` / `--say --show-memory` / `--selftest` | `tests/test_cli.py`（5 项） |
 | 紧凑契约真的更短、未被契约的字段别名被接住 | `tests/test_openai_compat.py` / `tests/test_packet_aliases.py`（5 项） |
+| 身份块来自 cortex/persona.py 且可被改写、纯发言降级、schema→object→off 阶梯、帧末尾格式提醒 | `tests/test_identity_and_fallback.py`（7 项） |
 | 记忆快照求差、`/cat` 路径解析、`/files` 渲染 | `tests/test_viewer.py`（7 项） |
 
 ---

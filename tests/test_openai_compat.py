@@ -51,8 +51,11 @@ def test_roundtrip_without_api_key():
         sent = server.requests[0]
         assert sent["model"] == "fake-local"
         assert sent["stream"] is False
-        assert sent["response_format"] == {"type": "json_object"}
+        # auto 模式优先语法约束（llama.cpp 会据此做 GBNF 解码）
+        assert sent["response_format"]["type"] == "json_schema"
+        assert "inner_monologue" in sent["response_format"]["json_schema"]["schema"]["properties"]
         assert [m["role"] for m in sent["messages"]] == ["system", "user"]
+        assert client.last_timings["predicted_per_second"] == 42.0
 
 
 def test_api_key_used_when_present(monkeypatch):
@@ -77,7 +80,9 @@ def test_extra_body_is_merged():
 # ---------------------------------------------------------------------------
 # 端点能力差异：自动降级
 # ---------------------------------------------------------------------------
-def test_json_mode_downgrade_when_endpoint_rejects_response_format():
+def test_schema_downgrades_to_json_object_then_off():
+    """三轮降级：json_schema（被拒）→ json_object（被拒）→ 关掉约束。"""
+
     def handler(payload, headers):
         if "response_format" in payload:
             return 400, {"error": {"message": "response_format is not supported"}}
@@ -87,9 +92,24 @@ def test_json_mode_downgrade_when_endpoint_rejects_response_format():
         client = OpenAICompatibleClient(make_config(server.base_url))
         data = json.loads(client.complete("S", "U"))
         assert data["say"] == "收到，我在这里。"
+        assert server.calls == 3
+        assert server.requests[0]["response_format"]["type"] == "json_schema"
+        assert server.requests[1]["response_format"] == {"type": "json_object"}
+        assert "response_format" not in server.requests[2]
+        assert any("json_schema" in note for note in client.notes)
+
+
+def test_schema_only_downgrades_one_step():
+    def handler(payload, headers):
+        if payload.get("response_format", {}).get("type") == "json_schema":
+            return 400, {"error": {"message": "json_schema is not supported by this build"}}
+        return chat_reply(json.dumps(packet()))
+
+    with FakeOpenAI(handler) as server:
+        client = OpenAICompatibleClient(make_config(server.base_url))
+        json.loads(client.complete("S", "U"))
         assert server.calls == 2
-        assert "response_format" not in server.requests[1]
-        assert any("response_format" in note for note in client.notes)
+        assert server.requests[1]["response_format"] == {"type": "json_object"}
 
 
 def test_max_tokens_downgrade():
@@ -134,18 +154,29 @@ def test_json_inside_reasoning_content_is_recovered():
         assert json.loads(client.complete("S", "U"))["say"] == "思考通道里的回答。"
 
 
-def test_non_json_output_triggers_one_repair_request():
+def test_broken_json_triggers_one_repair_request():
+    broken = '{"inner_monologue": "想了", "say": '
+
     def handler(payload, headers):
         last = payload["messages"][-1]["content"]
         if "不是合法 JSON" in last:
             return chat_reply(json.dumps(packet(say="修好了。"), ensure_ascii=False))
-        return chat_reply("我先想了想，这件事得记下来。")
+        return chat_reply(broken)
 
     with FakeOpenAI(handler) as server:
         client = OpenAICompatibleClient(make_config(server.base_url))
         assert json.loads(client.complete("S", "U"))["say"] == "修好了。"
         assert server.calls == 2
         assert "不是合法 JSON" in server.requests[1]["messages"][-1]["content"]
+
+
+def test_pure_prose_does_not_waste_a_repair_request():
+    """纯散文不是“写坏的 JSON”：不重发（省一整趟生成），交给内核降级成发言。"""
+    with FakeOpenAI(lambda p, h: chat_reply("你好呀。我是星璃，我在这里。")) as server:
+        client = OpenAICompatibleClient(make_config(server.base_url))
+        assert "星璃" in client.complete("S", "U")
+        assert server.calls == 1
+        assert client.notes == []
 
 
 def test_repair_can_be_disabled():
@@ -252,7 +283,8 @@ def test_compact_contract_shrinks_the_system_prompt(tmp_path: Path, clock):
         ws = Workspace.open(tmp_path / "xingli", cfg)
         hb = Heartbeat.create(ws, cfg, now_fn=clock)
         hb.handle_message("owner", "你好")
-        assert hb.last_frame.system == SYSTEM_CONTRACT_COMPACT
+        assert SYSTEM_CONTRACT_COMPACT in hb.last_frame.system
+        assert hb.last_frame.identity.startswith("【你是谁】")
         compact_tokens = hb.last_frame.total_tokens
 
     with FakeOpenAI() as server:
@@ -260,7 +292,7 @@ def test_compact_contract_shrinks_the_system_prompt(tmp_path: Path, clock):
         ws = Workspace.open(tmp_path / "full", cfg)
         hb = Heartbeat.create(ws, cfg, now_fn=clock)
         hb.handle_message("owner", "你好")
-        assert hb.last_frame.system != SYSTEM_CONTRACT_COMPACT
+        assert SYSTEM_CONTRACT_COMPACT not in hb.last_frame.system
         assert hb.last_frame.total_tokens > compact_tokens
 
 

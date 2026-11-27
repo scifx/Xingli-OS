@@ -18,16 +18,64 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 from kernel.config import Config
+from kernel.literal import load_literal
 from kernel.models import Event, ReflexSignal
 from kernel.paths import Workspace
 from kernel.sys2_llm import SYSTEM_CONTRACTS, SYSTEM_CONTRACT
-from kernel.textutil import estimate_tokens, truncate
+from kernel.textutil import estimate_tokens, one_line, truncate
 from memory.focal_context import FocalContext, FocalRender
 from memory.lod_renderer import LandscapeRender, LodRenderer
 from memory.store import MemoryStore
 from sensors.clock import ClockSensor
 from sensors.social import SocialSensor
 from sensors.world import WorldSensor
+
+
+#: 性格维度的中文名（cortex/persona.py 里是英文键，便于程序处理）
+TRAIT_NAMES = {
+    "curiosity": "好奇",
+    "directness": "直率",
+    "warmth": "温和",
+    "playfulness": "俏皮",
+    "self_respect": "自尊",
+    "empathy": "共情",
+    "patience": "耐心",
+    "focus": "专注",
+}
+
+
+OUTPUT_REMINDER = (
+    "[OUTPUT_FORMAT] 只输出一个 JSON 对象（不要解释、不要围栏）："
+    '{"inner_monologue":"…","say":"…或空串","memory_ops":[],"focus_update":null,'
+    '"emotion_delta":{},"wake":{}}'
+)
+
+
+def render_identity(persona: Mapping[str, Any], max_chars: int = 480) -> str:
+    """把 cortex/persona.py 压成一段“她是谁”（恒定短，可被进化改写）。"""
+    name = str(persona.get("NAME") or "星璃")
+    concept = one_line(str(persona.get("SELF_CONCEPT") or ""), 130)
+    values = [
+        one_line(str(v).rstrip("。；; "), 36) for v in (persona.get("VALUES") or [])
+    ][:4]
+    traits = persona.get("TRAITS") or {}
+    trait_text = " · ".join(
+        f"{TRAIT_NAMES.get(str(k), str(k))} {float(v):.2f}"
+        for k, v in traits.items()
+        if isinstance(v, (int, float))
+    )
+    lines = [f"【你是谁】{name}（Xingli）"]
+    if concept:
+        lines.append(f"你怎么理解自己：{concept}")
+    if values:
+        lines.append("你的底线：" + "；".join(values))
+    if trait_text:
+        lines.append("性格倾向：" + trait_text)
+    lines.append(
+        "说话用第一人称，有判断、有温度；不客套、不背说明书、不假装记得；"
+        "被问到自己是谁时，就讲你怎么记事（焦点视距 / 长期地貌 / 自己的 Git 账本）。"
+    )
+    return truncate("\n".join(lines), max_chars)
 
 
 @dataclass
@@ -42,6 +90,7 @@ class Frame:
     signals: list[ReflexSignal] = field(default_factory=list)
     event_text: str = ""
     speaker_id: str = "owner"
+    identity: str = ""
 
     def messages(self) -> list[dict[str, str]]:
         return [
@@ -75,6 +124,24 @@ class FrameCompiler:
         self.social = social or SocialSensor(ws, self._relations())
         self.world = world or WorldSensor(ws)
 
+    def persona(self) -> dict[str, Any]:
+        """读取 cortex/persona.py 的字面量（按 mtime 缓存，进化后自动失效）。"""
+        path = self.ws.persona_file
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            mtime = 0
+        cached = getattr(self, "_persona_cache", None)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        data: dict[str, Any] = {}
+        for key in ("NAME", "SELF_CONCEPT", "VALUES", "TRAITS"):
+            value = load_literal(path, key, None)
+            if value is not None:
+                data[key] = value
+        self._persona_cache = (mtime, data)
+        return data
+
     def _relations(self):
         from memory.relations import RelationsStore
 
@@ -91,7 +158,11 @@ class FrameCompiler:
     ) -> Frame:
         speaker = speaker_id or event.speaker_id
         cfg = self.config
-        system = SYSTEM_CONTRACTS.get(cfg.sys2.contract, SYSTEM_CONTRACT)
+        identity = render_identity(
+            self.persona(), max_chars=max(160, cfg.budget.section_identity * 2)
+        )
+        contract = SYSTEM_CONTRACTS.get(cfg.sys2.contract, SYSTEM_CONTRACT)
+        system = f"{identity}\n\n{contract}"
         system_tokens = estimate_tokens(system)
         user_budget = max(600, cfg.budget.frame_tokens - system_tokens)
 
@@ -124,8 +195,7 @@ class FrameCompiler:
         land_render = self.landscape.render(speaker, query, land_budget, boost_tags=boost)
 
         for _ in range(6):
-            user_text = "\n".join(
-                [
+            blocks = [
                     "[SITUATIONAL_ENV]",
                     env_text,
                     "[SYS1_INTUITION]",
@@ -136,8 +206,10 @@ class FrameCompiler:
                     land_render.text,
                     "[CURRENT_EVENT]",
                     event_text,
-                ]
-            )
+            ]
+            if cfg.sys2.contract_in_user:
+                blocks.extend([OUTPUT_REMINDER])
+            user_text = "\n".join(blocks)
             total = estimate_tokens(user_text) + system_tokens
             if total <= cfg.budget.frame_tokens:
                 break
@@ -177,6 +249,7 @@ class FrameCompiler:
             signals=list(signals),
             event_text=event_text,
             speaker_id=speaker,
+            identity=identity,
         )
 
     # ------------------------------------------------------------------

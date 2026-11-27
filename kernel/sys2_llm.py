@@ -19,7 +19,7 @@ import urllib.request
 from typing import Any, Protocol
 
 from kernel.config import Config
-from kernel.jsonx import loads_lenient, message_text
+from kernel.jsonx import loads_lenient, message_text, strip_fences
 from kernel.models import ThoughtPacket, dumps
 from kernel.textutil import one_line
 
@@ -36,10 +36,15 @@ SYSTEM_CONTRACT = """你是「星璃」。你不是在复述聊天记录，而�
     "about_ids":[],"visibility":[],"epistemic":"direct|hearsay|inferred",
     "importance":0.6,"tags":[],"pinned":false}]
 5. relation_ops: [{"person_id":"...","intimacy":0.8,"global_trust":0.9,"domain_trust":{"tech_opinion":0.7},"custom":{}}]
-6. say: "对当前说话人说的话" | {"to":"人物id","text":"..."} | null（null = 这一拍沉默/继续思考）
+6. say: "对当前说话人说的话" | {"to":"人物id","text":"..."} | null（null / 空串 = 这一拍沉默或继续思考）
 7. wake: {"continue_think":{"reason":"..."}|null, "schedule_wake":{"after_sec":600,"reason":"...","target_speaker":"owner"}|null}
 8. code_action: 可选受控 Python 片段 | null
 9. evolve_ops: [{"op":"teach_rule","rule":"..."} | {"op":"propose_reflex", ...} | {"op":"propose_skill","name":"...","code":"...","reason":"..."}]
+
+【说话方式】
+- 第一人称、有判断、有温度、不客套模板。被问到"你是谁/你是什么/介绍一下自己"时，
+  直说你是谁、你怎么记事（焦点视距、长期记忆、自己的 Git 账本），不要背说明书，也不要空泛。
+- 别把认知帧的分段名、哈希句柄、JSON 字段名说给人类听。
 
 【铁律】
 - 记忆里标注「转述待核实」的是 hearsay，不能当作事实，更不能覆盖亲历；想核实就在 say 里自然地问。
@@ -61,7 +66,7 @@ SYSTEM_CONTRACT_COMPACT = """你是「星璃」。你在一帧极短的世界快
 
 字段（按此顺序，其余可省略）：
 1. inner_monologue: 第一人称内心 OS（先想清楚）
-2. say: 对当前说话人说的话 | null（沉默）
+2. say: 对当前说话人说的话 | ""（沉默；被问到你是谁时用第一人称讲清你自己）
 3. memory_ops: [{"op":"recall","mem_id":"..."} | {"op":"recall_turn","turn_id":1} | {"op":"search_memory","query":"..."} | {"op":"memorize","lod0":"...","lod1":"...","lod2":"...","epistemic":"direct|hearsay","visibility":["owner"],"importance":0.6}]
 4. focus_update: {"turn_id":0,"decay_before":0.35,"decay_after":0.2,"pin":[],"unpin":[]} | null
 5. emotion_delta: {"warmth":0.05} | {}
@@ -75,6 +80,89 @@ SYSTEM_CONTRACTS = {
     "full": SYSTEM_CONTRACT,
     "compact": SYSTEM_CONTRACT_COMPACT,
 }
+
+
+#: 认知包的 JSON Schema：交给 llama.cpp / vLLM 做语法约束解码（本地小模型的救命稻草）
+THOUGHT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "inner_monologue": {"type": "string"},
+        "focus_update": {
+            "type": "object",
+            "properties": {
+                "turn_id": {"type": "integer"},
+                "decay_before": {"type": "number"},
+                "decay_after": {"type": "number"},
+                "pin": {"type": "array", "items": {"type": "integer"}},
+                "unpin": {"type": "array", "items": {"type": "integer"}},
+            },
+        },
+        "emotion_delta": {"type": "object", "additionalProperties": {"type": "number"}},
+        "memory_ops": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string"},
+                    "mem_id": {"type": "string"},
+                    "turn_id": {"type": "integer"},
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "lod0": {"type": "string"},
+                    "lod1": {"type": "string"},
+                    "lod2": {"type": "string"},
+                    "kind": {"type": "string"},
+                    "about_ids": {"type": "array", "items": {"type": "string"}},
+                    "visibility": {"type": "array", "items": {"type": "string"}},
+                    "epistemic": {"type": "string"},
+                    "importance": {"type": "number"},
+                    "pinned": {"type": "boolean"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+        "relation_ops": {"type": "array", "items": {"type": "object"}},
+        "say": {"type": "string"},
+        "wake": {
+            "type": "object",
+            "properties": {
+                "continue_think": {
+                    "type": "object",
+                    "properties": {"reason": {"type": "string"}},
+                },
+                "schedule_wake": {
+                    "type": "object",
+                    "properties": {
+                        "after_sec": {"type": "number"},
+                        "reason": {"type": "string"},
+                        "target_speaker": {"type": "string"},
+                    },
+                },
+            },
+        },
+        "code_action": {"type": "string"},
+        "evolve_ops": {"type": "array", "items": {"type": "object"}},
+    },
+    "required": ["inner_monologue", "say"],
+}
+
+
+def response_formats(mode: str) -> list[str]:
+    """结构化输出方式的降级阶梯。``auto`` = 语法约束 → JSON 模式 → 关闭。"""
+    mode = (mode or "auto").strip().lower()
+    if mode in {"off", "none", "false", "0"}:
+        return ["off"]
+    if mode in {"json_object", "object"}:
+        return ["json_object", "off"]
+    return ["json_schema", "json_object", "off"]
+
+
+def looks_like_json_attempt(text: str) -> bool:
+    """输出像“写坏的 JSON”（而不是纯散文）时才值得再花一趟去修。"""
+    body = strip_fences(text or "")
+    if body.lstrip().startswith("{"):
+        return True
+    return "{" in body and any(h in body for h in ("inner_monologue", "say", "memory_ops"))
 
 
 class Sys2Error(RuntimeError):
@@ -117,6 +205,9 @@ class OpenAICompatibleClient:
             raise Sys2Error("sys2.base_url 未配置（例如 http://127.0.0.1:8080/v1）")
         self.model = cfg.model or "local-model"
         self.name = f"openai_compatible:{self.model}"
+        self.last_timings: dict[str, Any] = {}
+        self.last_usage: dict[str, Any] = {}
+        self.notes: list[str] = []
         if cfg.contract not in SYSTEM_CONTRACTS:
             raise Sys2Error(
                 f"未知的 sys2.contract: {cfg.contract}（可选 {', '.join(SYSTEM_CONTRACTS)}）"
@@ -134,7 +225,7 @@ class OpenAICompatibleClient:
         self,
         messages: list[dict[str, str]],
         *,
-        json_mode: bool,
+        response_format: str,
         temperature: float | None = None,
         max_tokens_key: str = "max_tokens",
     ) -> dict[str, Any]:
@@ -146,7 +237,12 @@ class OpenAICompatibleClient:
             max_tokens_key: cfg.max_tokens,
             "stream": False,
         }
-        if json_mode:
+        if response_format == "json_schema":
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "thought_packet", "schema": THOUGHT_SCHEMA},
+            }
+        elif response_format == "json_object":
             payload["response_format"] = {"type": "json_object"}
         payload.update(dict(cfg.extra_body or {}))
         return payload
@@ -183,13 +279,16 @@ class OpenAICompatibleClient:
         temperature: float | None = None,
     ) -> str:
         cfg = self.config.sys2
-        json_mode = cfg.json_mode
+        formats = response_formats(cfg.structured_output)
+        fi = 0
+        downgrades = 0
         max_tokens_key = "max_tokens"
+        attempt = 0
         last_error: Exception | None = None
-        for attempt in range(max(1, cfg.retries + 1)):
+        while fi < len(formats):
             payload = self._payload(
                 messages,
-                json_mode=json_mode,
+                response_format=formats[fi],
                 temperature=temperature,
                 max_tokens_key=max_tokens_key,
             )
@@ -198,13 +297,22 @@ class OpenAICompatibleClient:
             except _HttpFailure as exc:
                 hint = exc.detail.lower()
                 last_error = exc
-                if json_mode and exc.status in {400, 404, 415, 422} and (
-                    "response_format" in hint or "json_object" in hint or "grammar" in hint
-                ):
-                    self._note("端点不支持 response_format，已改用提示词约束 JSON")
-                    json_mode = False
+                rejects_format = exc.status in {400, 404, 415, 422} and any(
+                    key in hint
+                    for key in ("response_format", "json_schema", "json_object", "schema", "grammar")
+                )
+                if rejects_format and downgrades < len(formats) - 1:
+                    downgrades += 1
+                    self._note(
+                        f"端点拒绝 {formats[fi]}（HTTP {exc.status}），降级为 {formats[fi + 1]}"
+                    )
+                    fi += 1
                     continue
-                if exc.status in {400, 422} and "max_tokens" in hint:
+                if (
+                    exc.status in {400, 422}
+                    and "max_tokens" in hint
+                    and max_tokens_key == "max_tokens"
+                ):
                     self._note("端点要求 max_completion_tokens，已自动切换")
                     max_tokens_key = "max_completion_tokens"
                     continue
@@ -218,18 +326,19 @@ class OpenAICompatibleClient:
             except Sys2Error as exc:
                 last_error = exc
                 if attempt < cfg.retries:
-                    time.sleep(0.6 * (attempt + 1))
+                    attempt += 1
+                    time.sleep(0.6 * attempt)
                     self._note(f"请求失败，重试一次：{exc}")
                     continue
                 raise
+            self.last_timings = data.get("timings") or {}
+            self.last_usage = data.get("usage") or {}
             return message_text(data)
-        raise Sys2Error(str(last_error))
+        raise Sys2Error(str(last_error or "响应格式协商失败"))
 
     def _note(self, text: str) -> None:
-        notes = getattr(self, "notes", None)
-        if notes is None:
-            notes = self.notes = []
-        notes.append(text)
+        self.notes.append(text)
+        del self.notes[:-20]  # 只留最近 20 条
 
     # ------------------------------------------------------------------
     def complete(self, system: str, user: str) -> str:
@@ -239,7 +348,7 @@ class OpenAICompatibleClient:
             {"role": "user", "content": user},
         ]
         text = self._chat(messages)
-        if cfg.repair and loads_lenient(text) is None:
+        if cfg.repair and loads_lenient(text) is None and looks_like_json_attempt(text):
             self._note("模型输出不是 JSON，追加一次修复请求")
             repair_messages = [
                 *messages,

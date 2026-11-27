@@ -26,6 +26,7 @@ def chat_reply(content: str | None, *, reasoning: str | None = None) -> dict[str
         "model": "fake-local",
         "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+        "timings": {"predicted_n": 20, "predicted_per_second": 42.0},
     }
 
 

@@ -63,7 +63,9 @@ class Sys2Config:
     max_tokens: int = 1400
     timeout_sec: float = 90.0
     json_mode: bool = True
-    #: 输出不是 JSON 时追加一次“只要 JSON”的修复请求（本地小模型很有用）
+    #: 结构化输出方式：auto（json_schema → json_object → 关）/ json_schema / json_object / off
+    structured_output: str = "auto"
+    #: 输出像坏掉的 JSON 时追加一次修复请求（纯散文不浪费这一趟）
     repair: bool = True
     #: 网络/连接失败的重试次数（不含上面那种降级重试）
     retries: int = 1
@@ -71,6 +73,8 @@ class Sys2Config:
     extra_body: Mapping[str, Any] = field(default_factory=dict)
     #: 行动契约版本：full（默认）| compact（小模型 / 紧张上下文）
     contract: str = "full"
+    #: 在认知帧末尾再贴一次“只要 JSON”的短提醒（有些模型的 chat template 会吞掉 system）
+    contract_in_user: bool = False
 
     @property
     def resolved_api_key(self) -> str:
@@ -89,10 +93,15 @@ class Sys2Config:
             max_tokens=_as_int(d.get("max_tokens"), cls.max_tokens),
             timeout_sec=_as_float(d.get("timeout_sec"), cls.timeout_sec),
             json_mode=_as_bool(d.get("json_mode"), cls.json_mode),
+            structured_output=_as_str(
+                d.get("structured_output"),
+                "auto" if _as_bool(d.get("json_mode"), cls.json_mode) else "off",
+            ),
             repair=_as_bool(d.get("repair"), cls.repair),
             retries=_as_int(d.get("retries"), cls.retries),
             extra_body=_as_mapping(d.get("extra_body")),
             contract=_as_str(d.get("contract"), cls.contract),
+            contract_in_user=_as_bool(d.get("contract_in_user"), cls.contract_in_user),
         )
 
 
@@ -142,6 +151,7 @@ class BudgetConfig:
 
     frame_tokens: int = 6000
     section_env: int = 700
+    section_identity: int = 240
     section_sys1: int = 700
     section_focal: int = 2300
     section_landscape: int = 2000
@@ -157,6 +167,7 @@ class BudgetConfig:
         return cls(
             frame_tokens=_as_int(d.get("frame_tokens"), cls.frame_tokens),
             section_env=_as_int(d.get("section_env"), cls.section_env),
+            section_identity=_as_int(d.get("section_identity"), cls.section_identity),
             section_sys1=_as_int(d.get("section_sys1"), cls.section_sys1),
             section_focal=_as_int(d.get("section_focal"), cls.section_focal),
             section_landscape=_as_int(d.get("section_landscape"), cls.section_landscape),
