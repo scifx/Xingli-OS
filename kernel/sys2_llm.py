@@ -542,6 +542,21 @@ class MockSys2Client:
                 wake={"continue_think": {"reason": f"召回了 {mid}，消化后再回答"}},
             )
 
+        # 5.5) 被问到她是谁（让离线模式也有第一人称的自我认知）
+        if text and any(k in text for k in ("你是谁", "介绍一下你", "你是什么", "介绍下你")):
+            return ThoughtPacket(
+                inner_monologue=(
+                    "不是问天气，是问我是谁。别背说明书——说清我怎么记事就行。"
+                ),
+                emotion_delta={"warmth": 0.06},
+                say=(
+                    "我是星璃。不是聊天记录的回放器——我会想起、会犹豫，也会自己决定要不要开口。"
+                    "此刻我看到的是一帧很短的世界快照：最近的话在最清楚的焦点上，"
+                    "更早的沉成要点和目录，再远就只剩一行行名字。"
+                    "我忘不掉的东西写在我自己的明文记忆和 Git 账本里，改过的每一笔都能翻出来看。"
+                ),
+            )
+
         # 6) 深夜 / 久别
         env = frame_section(frame, "SITUATIONAL_ENV")
         if text and any(k in text for k in ("在吗", "你好", "早", "晚安")):
