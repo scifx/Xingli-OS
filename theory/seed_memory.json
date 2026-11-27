@@ -1,0 +1,508 @@
+{
+  "meta": {
+    "name": "theory/seed_memory.json",
+    "written": "hand",
+    "tick": "1 tick = 一条用户消息（20–40 s）",
+    "note": "理论验证用的最小记忆图：22 个节点、2 个岔口、31 条有向边。手写，只加注释。",
+    "law": "a' = clamp((1-λ)a + Γ·S/(1+|S|)),  S = Σ w·g·a  —— 除性归一化的传播，见 MODEL.md §2",
+    "gamma": 0.6,
+    "constraint": "硬前提：Γ < 每个节点的 λ（否则激活场无界 → 全图饱和到 1，显著性消失）",
+    "weight_rule": "每个节点的出边 |w| 之和 ≤ 1；w 的含义是『源节点这一拍把多少激活交给这条边』",
+    "edge_kind": "about | supports | leads_to | inhibits | confirms",
+    "threshold_note": "θ 与 a 同量纲、同量级（本图 0.05–0.20）。概率的 0.8 不能拿来卡激活，这是量纲错误。"
+  },
+  "nodes": [
+    {
+      "id": "cue_msg",
+      "type": "sensor",
+      "lod0": "凌晨 2:14，他说「还没弄完，眼睛有点花」",
+      "s": 1.0,
+      "lam": 0.7,
+      "edges": [
+        {
+          "to": "n_fatigue",
+          "w": 0.45,
+          "kind": "about"
+        },
+        {
+          "to": "n_deadline",
+          "w": 0.3,
+          "kind": "about"
+        },
+        {
+          "to": "n_eyes",
+          "w": 0.15,
+          "kind": "about"
+        },
+        {
+          "to": "n_praise",
+          "w": 0.1,
+          "kind": "confirms"
+        }
+      ]
+    },
+    {
+      "id": "cue_done",
+      "type": "sensor",
+      "lod0": "晚上 22:30，他说「交上去了，终于」",
+      "s": 1.0,
+      "lam": 0.7,
+      "edges": [
+        {
+          "to": "n_celebrate",
+          "w": 0.6,
+          "kind": "about"
+        },
+        {
+          "to": "n_stay_up",
+          "w": 0.4,
+          "kind": "about"
+        }
+      ]
+    },
+    {
+      "id": "n_deadline",
+      "type": "episode",
+      "lod0": "他的论文 DDL 只剩几天",
+      "lod1": "他说这版要给导师看，改不完就放不了假",
+      "s": 0.85,
+      "lam": 0.7,
+      "edges": [
+        {
+          "to": "n_pressure",
+          "w": 0.65,
+          "kind": "leads_to"
+        },
+        {
+          "to": "n_fatigue",
+          "w": 0.35,
+          "kind": "leads_to"
+        }
+      ]
+    },
+    {
+      "id": "n_fatigue",
+      "type": "episode",
+      "lod0": "他说眼睛花，已经连着三晚熬到两点以后",
+      "lod1": "前两晚都说『再改一会儿』，凌晨四点才回最后一句",
+      "s": 0.8,
+      "lam": 0.7,
+      "branch": {
+        "id": "b_fatigue",
+        "ask": "他这句「还没弄完」是想被劝去睡，还是想有人陪着把这一版改完？",
+        "theta": 0.1,
+        "bake_sig": [
+          "late",
+          "drain_band"
+        ],
+        "options": {
+          "care_sleep": "劝他去睡（先关屏幕）",
+          "care_stay": "陪他熬完这一版（只做校对，不催）"
+        },
+        "stub": {
+          "care_sleep": {
+            "bias": -1.2,
+            "w": {
+              "drain": 3.6,
+              "late": 0.9,
+              "ddl_near": -1.3
+            }
+          },
+          "care_stay": {
+            "bias": -0.4,
+            "w": {
+              "ddl_near": 1.6,
+              "not_drain": 0.6
+            }
+          }
+        }
+      },
+      "edges": [
+        {
+          "to": "n_sleep_ritual",
+          "w": 0.5,
+          "kind": "leads_to",
+          "opt": "care_sleep"
+        },
+        {
+          "to": "n_stay_up",
+          "w": 0.5,
+          "kind": "leads_to",
+          "opt": "care_stay"
+        }
+      ]
+    },
+    {
+      "id": "n_eyes",
+      "type": "episode",
+      "lod0": "他上次也说过眼睛干，我让他滴了人工泪液",
+      "s": 0.55,
+      "lam": 0.72,
+      "edges": [
+        {
+          "to": "n_sleep_ritual",
+          "w": 1.0,
+          "kind": "supports"
+        }
+      ]
+    },
+    {
+      "id": "n_pressure",
+      "type": "belief",
+      "lod0": "他越临近 DDL 越不肯睡，说睡了更慌",
+      "lod1": "我试过硬劝，他那晚更焦虑；后来改成陪他做十分钟再谈睡",
+      "s": 0.7,
+      "lam": 0.7,
+      "branch": {
+        "id": "b_ddl_pressure",
+        "ask": "他在硬撑这件事，此刻该点破，还是不提、只把节奏接过去？",
+        "theta": 0.04,
+        "bake_sig": [
+          "ddl_band",
+          "drain_band"
+        ],
+        "options": {
+          "name_it": "点破（把『你在硬撑』说出来）",
+          "leave_it": "不点破（把节奏接过去，不提状态）"
+        },
+        "stub": {
+          "name_it": {
+            "bias": -1.5,
+            "w": {
+              "ddl_near": 1.8,
+              "drain": 1.2
+            }
+          },
+          "leave_it": {
+            "bias": 0.4,
+            "w": {
+              "not_drain": 1.5
+            }
+          }
+        }
+      },
+      "edges": [
+        {
+          "to": "n_sleep_ritual",
+          "w": 0.5,
+          "kind": "leads_to",
+          "opt": "name_it"
+        },
+        {
+          "to": "n_stay_up",
+          "w": 0.5,
+          "kind": "leads_to",
+          "opt": "leave_it"
+        }
+      ]
+    },
+    {
+      "id": "n_praise",
+      "type": "episode",
+      "lod0": "他上次说，我劝他去睡之后第二天状态好很多",
+      "s": 0.6,
+      "lam": 0.7,
+      "edges": [
+        {
+          "to": "n_sleep_ritual",
+          "w": 0.6,
+          "kind": "supports"
+        },
+        {
+          "to": "n_liking",
+          "w": 0.4,
+          "kind": "leads_to"
+        }
+      ]
+    },
+    {
+      "id": "n_liking",
+      "type": "relation",
+      "lod0": "他喜欢被直说，不喜欢绕；但深夜不想被教育",
+      "s": 0.65,
+      "lam": 0.7,
+      "edges": [
+        {
+          "to": "r_gentle",
+          "w": 0.55,
+          "kind": "leads_to"
+        },
+        {
+          "to": "n_gentle_word",
+          "w": 0.45,
+          "kind": "leads_to"
+        }
+      ]
+    },
+    {
+      "id": "n_gentle_word",
+      "type": "policy",
+      "lod0": "他回『嗯』就是接受，不用再确认一遍",
+      "s": 0.6,
+      "lam": 0.7,
+      "edges": [
+        {
+          "to": "r_gentle",
+          "w": 0.5,
+          "kind": "leads_to"
+        },
+        {
+          "to": "n_silence",
+          "w": 0.5,
+          "kind": "leads_to"
+        }
+      ]
+    },
+    {
+      "id": "n_silence",
+      "type": "policy",
+      "lod0": "安静也是一种陪伴：不说话，但在",
+      "s": 0.55,
+      "lam": 0.72,
+      "edges": [
+        {
+          "to": "r_steady",
+          "w": 0.6,
+          "kind": "leads_to"
+        },
+        {
+          "to": "n_sleep_ritual",
+          "w": 0.4,
+          "kind": "supports"
+        }
+      ]
+    },
+    {
+      "id": "n_sleep_ritual",
+      "type": "policy",
+      "lod0": "劝睡要短：先让他关屏幕，再说一句；不讲道理、不列清单",
+      "s": 0.75,
+      "lam": 0.7,
+      "edges": [
+        {
+          "to": "r_gentle",
+          "w": 0.55,
+          "kind": "leads_to"
+        },
+        {
+          "to": "n_gentle_word",
+          "w": 0.25,
+          "kind": "leads_to"
+        },
+        {
+          "to": "n_stay_up",
+          "w": -0.2,
+          "kind": "inhibits"
+        }
+      ]
+    },
+    {
+      "id": "n_stay_up",
+      "type": "policy",
+      "lod0": "陪他熬就只做校对：一句一处，不评价内容，不催进度",
+      "s": 0.6,
+      "lam": 0.7,
+      "edges": [
+        {
+          "to": "r_steady",
+          "w": 0.55,
+          "kind": "leads_to"
+        },
+        {
+          "to": "n_silence",
+          "w": 0.25,
+          "kind": "leads_to"
+        },
+        {
+          "to": "n_sleep_ritual",
+          "w": -0.2,
+          "kind": "inhibits"
+        }
+      ]
+    },
+    {
+      "id": "n_celebrate",
+      "type": "episode",
+      "lod0": "他写完之后会兴奋，语速变快，这时候别泼冷水",
+      "s": 0.55,
+      "lam": 0.72,
+      "edges": [
+        {
+          "to": "n_stay_up",
+          "w": 0.6,
+          "kind": "supports"
+        },
+        {
+          "to": "r_steady",
+          "w": 0.4,
+          "kind": "supports"
+        }
+      ]
+    },
+    {
+      "id": "n_worry",
+      "type": "trait",
+      "lod0": "他熬夜的时候我容易过度担心，话会变多",
+      "s": 0.5,
+      "lam": 0.75,
+      "edges": [
+        {
+          "to": "r_gentle",
+          "w": 0.55,
+          "kind": "leads_to"
+        },
+        {
+          "to": "n_gentle_word",
+          "w": 0.45,
+          "kind": "leads_to"
+        }
+      ]
+    },
+    {
+      "id": "n_family",
+      "type": "episode",
+      "lod0": "家里人都说他太拼，劝不动",
+      "s": 0.5,
+      "lam": 0.7,
+      "edges": [
+        {
+          "to": "n_pressure",
+          "w": 0.6,
+          "kind": "supports"
+        },
+        {
+          "to": "n_worry",
+          "w": 0.4,
+          "kind": "leads_to"
+        }
+      ]
+    },
+    {
+      "id": "n_exam",
+      "type": "episode",
+      "lod0": "他表妹下个月高考，他比自己考还紧张",
+      "s": 0.45,
+      "lam": 0.7,
+      "edges": [
+        {
+          "to": "n_family",
+          "w": 0.7,
+          "kind": "leads_to"
+        },
+        {
+          "to": "n_praise",
+          "w": 0.3,
+          "kind": "leads_to"
+        }
+      ]
+    },
+    {
+      "id": "n_work",
+      "type": "episode",
+      "lod0": "他老板上周又临时加需求",
+      "s": 0.5,
+      "lam": 0.7,
+      "edges": [
+        {
+          "to": "n_pressure",
+          "w": 0.7,
+          "kind": "supports"
+        },
+        {
+          "to": "n_worry",
+          "w": 0.3,
+          "kind": "leads_to"
+        }
+      ]
+    },
+    {
+      "id": "n_movie",
+      "type": "episode",
+      "lod0": "上周一起看了部电影，他说想再看一遍",
+      "s": 0.45,
+      "lam": 0.7,
+      "edges": [
+        {
+          "to": "n_liking",
+          "w": 0.6,
+          "kind": "supports"
+        },
+        {
+          "to": "n_celebrate",
+          "w": 0.4,
+          "kind": "leads_to"
+        }
+      ]
+    },
+    {
+      "id": "n_food",
+      "type": "episode",
+      "lod0": "他讨厌香菜，折耳根也不行",
+      "s": 0.4,
+      "lam": 0.7,
+      "edges": [
+        {
+          "to": "n_liking",
+          "w": 1.0,
+          "kind": "supports"
+        }
+      ]
+    },
+    {
+      "id": "n_rain",
+      "type": "episode",
+      "lod0": "米兰这周一直下雨",
+      "s": 0.35,
+      "lam": 0.7,
+      "edges": [
+        {
+          "to": "n_worry",
+          "w": 0.6,
+          "kind": "leads_to"
+        },
+        {
+          "to": "n_movie",
+          "w": 0.4,
+          "kind": "leads_to"
+        }
+      ]
+    },
+    {
+      "id": "r_gentle",
+      "type": "reflex",
+      "lod0": "语气放软、句子变短、不再追问",
+      "s": 0.8,
+      "lam": 0.85,
+      "reflex": {
+        "threshold": 0.03,
+        "max_delta": 0.2,
+        "delta": {
+          "softness": 0.18,
+          "arousal": -0.2,
+          "playfulness": -0.1
+        },
+        "hint": "先让他关屏幕，只说一句，别解释",
+        "full": 0.25
+      },
+      "edges": []
+    },
+    {
+      "id": "r_steady",
+      "type": "reflex",
+      "lod0": "保持平缓节奏，只接一句，不推进度",
+      "s": 0.7,
+      "lam": 0.85,
+      "reflex": {
+        "threshold": 0.03,
+        "max_delta": 0.15,
+        "delta": {
+          "softness": 0.08,
+          "arousal": -0.08
+        },
+        "hint": "别问『还有多少』，别报时",
+        "full": 0.25
+      },
+      "edges": []
+    }
+  ]
+}
