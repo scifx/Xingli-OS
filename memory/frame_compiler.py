@@ -20,7 +20,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from kernel.config import Config
 from kernel.models import Event, ReflexSignal
 from kernel.paths import Workspace
-from kernel.sys2_llm import SYSTEM_CONTRACT
+from kernel.sys2_llm import SYSTEM_CONTRACTS, SYSTEM_CONTRACT
 from kernel.textutil import estimate_tokens, truncate
 from memory.focal_context import FocalContext, FocalRender
 from memory.lod_renderer import LandscapeRender, LodRenderer
@@ -91,7 +91,7 @@ class FrameCompiler:
     ) -> Frame:
         speaker = speaker_id or event.speaker_id
         cfg = self.config
-        system = SYSTEM_CONTRACT
+        system = SYSTEM_CONTRACTS.get(cfg.sys2.contract, SYSTEM_CONTRACT)
         system_tokens = estimate_tokens(system)
         user_budget = max(600, cfg.budget.frame_tokens - system_tokens)
 

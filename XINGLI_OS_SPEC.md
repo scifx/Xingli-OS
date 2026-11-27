@@ -354,4 +354,11 @@ $\text{Sys2}_\theta$ 默认通过**结构化 JSON 输出（Structured Output / `
 6. **唤醒配额**：`已触发/小时` 与 `待触发队列长度` 双闸门；Git 账本使用独立
    `GIT_DIR=.xingli/ledger.git`，work-tree 指向 `cortex/`，不污染主仓库历史。
 
+**端点适配**：`sys2` 与 `sys1` 都是 OpenAI 兼容 HTTP。实现里额外处理了本地端点常见的
+七种偏差（不需要 Key、不支持 `response_format`、只认 `max_completion_tokens`、围栏/废话/
+尾逗号、JSON 落在 `reasoning_content`、完全不输出 JSON、连接抖动），并对 Sys1 加了
+60 秒断路器，端点挂掉时自动退回本地词法而不拖慢每一拍。CLI 提供
+`--init-config / --ping / --selftest`，`--selftest` 会真跑一轮并打印新建的记忆文件。
+行动契约有 `full` / `compact` 两个版本（字段与语义相同，只改措辞与示例长度），供小模型使用。
+
 **仍未验证**：真实底座模型的表达质量、真实 Jev / Decisions 端点的语义准确率、任何 benchmark。

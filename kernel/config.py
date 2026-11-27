@@ -46,6 +46,10 @@ def _as_str(value: Any, default: str) -> str:
     return default if value is None else str(value)
 
 
+def _as_mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
 @dataclass(frozen=True)
 class Sys2Config:
     """System Two：生成式大模型（前额叶）配置。"""
@@ -59,6 +63,14 @@ class Sys2Config:
     max_tokens: int = 1400
     timeout_sec: float = 90.0
     json_mode: bool = True
+    #: 输出不是 JSON 时追加一次“只要 JSON”的修复请求（本地小模型很有用）
+    repair: bool = True
+    #: 网络/连接失败的重试次数（不含上面那种降级重试）
+    retries: int = 1
+    #: 原样并入请求体的额外字段，例如 { chat_template_kwargs = { enable_thinking = false } }
+    extra_body: Mapping[str, Any] = field(default_factory=dict)
+    #: 行动契约版本：full（默认）| compact（小模型 / 紧张上下文）
+    contract: str = "full"
 
     @property
     def resolved_api_key(self) -> str:
@@ -77,6 +89,10 @@ class Sys2Config:
             max_tokens=_as_int(d.get("max_tokens"), cls.max_tokens),
             timeout_sec=_as_float(d.get("timeout_sec"), cls.timeout_sec),
             json_mode=_as_bool(d.get("json_mode"), cls.json_mode),
+            repair=_as_bool(d.get("repair"), cls.repair),
+            retries=_as_int(d.get("retries"), cls.retries),
+            extra_body=_as_mapping(d.get("extra_body")),
+            contract=_as_str(d.get("contract"), cls.contract),
         )
 
 
@@ -97,6 +113,9 @@ class Sys1Config:
     api_key: str = ""
     model: str = ""
     timeout_sec: float = 8.0
+    max_tokens: int = 300
+    #: 原样并入请求体的额外字段（与 sys2.extra_body 同义）
+    extra_body: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def resolved_api_key(self) -> str:
@@ -112,6 +131,8 @@ class Sys1Config:
             api_key=_as_str(d.get("api_key"), cls.api_key),
             model=_as_str(d.get("model"), cls.model),
             timeout_sec=_as_float(d.get("timeout_sec"), cls.timeout_sec),
+            max_tokens=_as_int(d.get("max_tokens"), cls.max_tokens),
+            extra_body=_as_mapping(d.get("extra_body")),
         )
 
 

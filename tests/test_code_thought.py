@@ -241,8 +241,26 @@ def test_any_json_packet_applies_all_fields(ws, clock):
     assert hb.emotion.load().values["warmth"] > 0.6
 
 
-def test_build_sys2_requires_key_without_mock(ws):
+def test_build_sys2_allows_local_endpoint_without_key(ws):
+    """本地 llama.cpp 不需要 Key：只要 base_url 在，就能构造客户端。"""
     from kernel.sys2_llm import Sys2Error
 
+    client = build_sys2(
+        Config(
+            sys2=Sys2Config(
+                provider="openai_compatible",
+                base_url="http://127.0.0.1:8080/v1",
+                api_key_env="DEFINITELY_NOT_SET",
+            )
+        )
+    )
+    assert client.name.startswith("openai_compatible")
+
     with pytest.raises(Sys2Error):
-        build_sys2(Config(sys2=Sys2Config(provider="openai_compatible", api_key_env="DEFINITELY_NOT_SET")))
+        build_sys2(
+            Config(
+                sys2=Sys2Config(
+                    provider="openai_compatible", base_url="", api_key_env="DEFINITELY_NOT_SET"
+                )
+            )
+        )

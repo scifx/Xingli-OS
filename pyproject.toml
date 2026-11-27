@@ -20,6 +20,7 @@ xingli = "cli:main"
 
 [tool.setuptools]
 packages = ["kernel", "memory", "sensors", "cortex", "cortex.skills"]
+py-modules = ["cli", "demo", "viewer"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

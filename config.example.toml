@@ -1,19 +1,33 @@
 # 星璃 Xingli-OS 配置示例
 # 复制到工作区根目录并改名为 xingli.toml（或 config.toml）。
 # 不写任何配置、不配任何 Key，也能以离线模式跑通全部机制（mock 大脑 + 本地词法 Sys1）。
+#
+# 本地 llama.cpp 最省事的路径（不用手改这个文件）：
+#   llama-server -m qwen2.5-7b-instruct-q4_k_m.gguf -c 8192 --port 8080
+#   python cli.py --init-config --base-url http://127.0.0.1:8080/v1 --model qwen2.5-7b-instruct-q4_k_m
+#   python cli.py --ping      # 看端点是否在线、模型名对不对
+#   python cli.py --selftest  # 真跑一轮，打印解析结果与新建的记忆文件
+#   python cli.py             # 开始聊
 
 # ── System Two：生成式大模型（前额叶）────────────────────────────────
 [sys2]
 # mock            : 离线确定性脚本大脑，只用于验证管线，不是真智能
-# openai_compatible: 任何 OpenAI 兼容端点（官方 / DeepSeek / 本地 vLLM …）
+# openai_compatible: 任何 OpenAI 兼容端点（llama.cpp / vLLM / LM Studio / 官方 / DeepSeek）
 provider = "mock"
-base_url = "https://api.openai.com/v1"
+base_url = "http://127.0.0.1:8080/v1"
+api_key = ""                  # 本地服务通常不校验；云端点留空并改用 api_key_env
 api_key_env = "XINGLI_SYS2_KEY"
-model = "gpt-4o-mini"
+model = "qwen2.5-7b-instruct-q4_k_m"
 temperature = 0.7
 max_tokens = 1400
-timeout_sec = 90
-json_mode = true          # 要求模型返回 JSON 认知包
+timeout_sec = 300             # CPU 推理一帧可能要几十秒
+contract = "full"             # full | compact：7B 级别或上下文紧张时用 compact
+json_mode = true              # 端点不支持 response_format 时自动降级
+repair = true                 # 输出不是 JSON 时追加一次“只要 JSON”的修复请求
+retries = 1                   # 连接失败重试次数（降级重试不计入）
+# 额外字段原样并入请求体。若模型把预算全花在思考上导致 content 为空：
+# [sys2.extra_body]
+# chat_template_kwargs = { enable_thinking = false }
 
 # ── System One：模糊决策模型（丘脑 / 杏仁核）──────────────────────────
 [sys1]
@@ -25,7 +39,9 @@ provider = "local"
 base_url = ""             # 例如 "https://api.typesafe.ai" / "https://openrouter.ai/api/v1"
 api_key_env = "XINGLI_SYS1_KEY"
 model = ""                # 例如 "typesafe/jev-1.13"
-timeout_sec = 8
+timeout_sec = 15
+max_tokens = 300          # 仅 llm_fallback 用
+# 连续失败两次后自动退回本地词法（60s 断路器），不拖慢每一拍
 
 # ── 预算与硬熔断（铁律 6）────────────────────────────────────────────
 [budget]

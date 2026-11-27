@@ -8,7 +8,7 @@
 
 纯标准库 Python 实现了 M1–M4 的核心闭环：**认知帧 + 焦点双向 LOD + 结构化认知包（可选代码载荷）
 + System One 三段门控 + 物理隐私墙/信源溯源 + 受控自进化（AST 审计/子进程试跑/回归/Git 账本）
-+ 睡眠整合（蒸馏/衰减/反失忆抽查）**，并配有 57 个 pytest 与一个 50 项机制的离线验证脚本。
++ 睡眠整合（蒸馏/衰减/反失忆抽查）**，并配有 96 个 pytest（其中 26 个打在本地假端点，验证真实协议路径）与一个 50 项机制的离线验证脚本。
 
 它**没有**验证的部分也写在明处：真实底座模型的表达质量、真实 Jev 端点的语义准确率、
 任何 benchmark 成绩。离线 `mock` 大脑是**确定性脚本**，只负责让管线可复现。
@@ -22,16 +22,18 @@
 python demo.py
 
 # 2) 自动化测试
-python -m pytest -q            # 57 passed
+python -m pytest -q            # 96 passed
 
 # 3) CLI 聊天台（离线）
 python cli.py --mock
-#   进去后：/help  /as colleague_b  /frame  /focus  /sleep  /log  /rollback <commit>
+#   进去后：/help  /files  /cat <id>  /tree  /status  /as  /frame  /focus  /sleep  /log  /rollback
 
-# 4) 接真实模型
-cp config.example.toml xingli.toml
-#   把 [sys2] provider 改成 openai_compatible，并 export XINGLI_SYS2_KEY=...
-#   有 Jev Key 时把 [sys1] provider 改成 jev 并填 base_url
+# 4) 接本地 llama.cpp（或任何 OpenAI 兼容端点）
+llama-server -m model.gguf -c 8192 --port 8080
+python cli.py --init-config --base-url http://127.0.0.1:8080/v1 --model <模型名>
+python cli.py --ping        # /v1/models 探测
+python cli.py --selftest    # 真跑一轮 + 打印新建记忆文件
+python cli.py               # 开聊（每轮打印记忆变化）
 ```
 
 运行时产生的记忆、账本、状态都在 `.xingli/` 与 `cortex/{episodes,turns,state}/`（已 gitignore）；
@@ -72,7 +74,10 @@ cp config.example.toml xingli.toml
 | `kernel/evolution.py` | 把“提案 → 审计 → 试跑 → 回归 → 提交/回滚 + 免疫记忆”串成一条管线 |
 | `kernel/regression.py` | 进化回归探针（在候选皮层上跑核心不变量） |
 | `memory/relations.py` / `memory/emotion.py` | 关系字典与情绪状态机（限幅 + 基线回弹） |
+| `kernel/jsonx.py` | 模型输出的宽容解析（围栏、废话、尾逗号、reasoning 通道） |
+| `viewer.py` | 把 `cortex/` 的明文变化渲染成终端里的“记忆变化”（CLI 专用） |
 | `demo.py` | 理论模型验证脚本（离线、可复现、带数字） |
+| `tests/fake_openai.py` | 本地假端点：离线验证真实协议路径（降级/围栏/401/重试） |
 
 ---
 
@@ -103,6 +108,104 @@ CLI 与 `demo.py` 都只消费这个结构——没有隐藏状态。
 
 ---
 
+## 3.5 接真实端点（llama.cpp / 任何 OpenAI 兼容 / Jev）
+
+星璃只有两个外部依赖，都是 HTTP，都是可选的：
+
+| 回路 | 配置 | 请求形状 |
+|---|---|---|
+| System Two（前额叶） | `[sys2] provider = "openai_compatible"` | `POST {base_url}/chat/completions`，恒定为 `system` + `user` **两条消息** |
+| System One（丘脑） | `[sys1] provider = "llm_fallback"` / `"jev"` / `"openai_decisions"` | 一次请求并行评估所有感知器；失败自动退回本地词法 |
+
+### 本地 llama.cpp 的四步
+
+```bash
+llama-server -m model.gguf -c 8192 --port 8080            # 1) 起服务
+python cli.py --init-config --base-url http://127.0.0.1:8080/v1 --model <模型名>   # 2) 写配置
+python cli.py --ping                                      # 3) /v1/models 探测
+python cli.py --selftest                                  # 4) 真跑一轮 + 打印记忆文件
+```
+
+`--selftest` 会：探测端点 → 建临时工作区（`.xingli/selftest`，每次重建）→ 发一句
+“记住……” → 打印**解析模式、帧 Token、内心 OS、她说的话、记忆变化、新记忆文件原文**。
+它把“端点通不通”和“她有没有真的长记忆”一次验证完。
+
+**上下文长度**：一次请求 = 系统契约（683 / compact 327）+ 认知帧（≤ `budget.frame_tokens`，默认 6000）
++ 生成（`max_tokens`，默认 1400）。所以 `llama-server -c` 至少 8192，建议 16384；
+只有 8K 上下文时把 `[budget] frame_tokens` 降到 4000 即可，LOD 会自动按预算降级。
+
+### 真实端点常见的毛病，客户端已经处理
+
+| 毛病 | 处理方式 | 配置 |
+|---|---|---|
+| 本地服务不校验 Key | 没有 Key 就不发 `Authorization`；401 时提示“本地通常不需要 Key” | `api_key = ""` |
+| 不支持 `response_format`（老版 llama.cpp / 某些代理） | 400 且错误里含 `response_format` → 自动去掉重发 | `json_mode = true` |
+| 只认 `max_completion_tokens` | 400 且错误里含 `max_tokens` → 自动换字段重发 | 自动 |
+| 输出带 ```json 围栏 / 前后有人话 / 尾随逗号 | 围栏剥离 + 括号配平截取 + 尾逗号容错 | `kernel/jsonx.py` |
+| 把 JSON 塞进 `reasoning_content`，`content` 为空 | 依次尝试 content / reasoning / text 通道 | 自动 |
+| 完全不肯输出 JSON | 追加一次“只输出 JSON、不要解释”的修复请求 | `repair = true` |
+| 连接抖动 | 重试一次（0.6s 退避） | `retries = 1` |
+| 模型把预算花在思考上 | 用额外字段关掉思考模板 | `[sys2.extra_body] chat_template_kwargs = { enable_thinking = false }` |
+| 不按契约命名（`reply`/`monologue`/`memories`），或把包在外壳里 | 别名表 + 单层解包 + 单对象包成数组，并在 `parse_warnings` 里留下“降级记录” | `kernel/models.py::PACKET_ALIASES` |
+| 小模型跟不上长契约 | 换紧凑契约（683 → 327 tokens，字段与例子都更短） | `[sys2] contract = "compact"` |
+
+小模型建议 `--init-config --contract compact`：只改系统契约的措辞与示例长度，
+认知帧、记忆格式、安全边界完全不变——这是“模型能力适配”，不是“设计降级”。
+
+`--status` 会显示最近三条“适配记录”（例如“端点不支持 response_format，已改用提示词约束 JSON”），
+让你知道刚才悄悄降级了什么，而不是假装一切正常。
+
+### System One 的三档接法
+
+* `local`（默认）：离线词法近似，零延迟。**先用它把聊天跑顺**；
+* `llm_fallback`：任何 OpenAI 兼容 `/chat/completions`，一次请求拿到全部感知器的概率；
+* `jev` / `openai_decisions`：真正实现了 `/v1/systemone` 或 `/v1/decisions` 的专用端点。
+
+后两者都包在 `ChainClient` 里：**连续失败 2 次后打开 60s 断路器**，期间直接走本地词法，
+避免“端点挂了 → 每一拍都白等一次超时”。`/status` 里能看到断路器状态。
+
+### 记忆文件长什么样
+
+一轮对话后，`cortex/` 里至少会多两个明文文件：
+
+```
+cortex/episodes/f9b67852df8a.json   长期记忆节点（LOD0/1/2 + 来源 + 认识论 + 可见性）
+cortex/turns/000002.json            这一轮的完整轮次（含内心 OS）
+cortex/state/{emotion,focus,reflex_state}.json  运行时状态（每拍都会动）
+```
+
+`episodes/<id>.json` 的字段按 **可读顺序** 落盘（不是字母序）：
+
+```json
+{
+  "id": "f9b67852df8a",
+  "kind": "episode",
+  "lod0": "下周三上午看牙医（别排别的事）",
+  "lod1": "主人说下周三上午要去医院看牙，当天不要安排其它事情。",
+  "lod2": "主人对星璃说：记住，我下周三要去看牙医。",
+  "source_id": "owner",
+  "about_ids": ["owner"],
+  "epistemic": "direct",
+  "visibility": ["owner"],
+  "importance": 0.85,
+  "pinned": false,
+  "tags": ["承诺"],
+  "emotion": {},
+  "refs": [],
+  "created_at": "2026-11-27T11:08:07+00:00",
+  "updated_at": "2026-11-27T11:08:07+00:00",
+  "last_accessed": "2026-11-27T11:08:07+00:00",
+  "access_count": 0,
+  "archived": false,
+  "schema_version": 1
+}
+```
+
+`id` 是内容哈希：同一件事重复说不会长出重复节点（`access_count` 增加）。
+`/cat <id>` 直接打印这个文件；`/files` 列出全部；`/tree` 看占用。
+
+---
+
 ## 4. 数据契约（落盘形态）
 
 **长期记忆节点** `cortex/episodes/<id>.json`（id = 内容哈希前 12 位）：
@@ -124,6 +227,7 @@ CLI 与 `demo.py` 都只消费这个结构——没有隐藏状态。
   "emotion": {"valence": 0.3, "arousal": 0.7},
   "refs": ["b81e04…"],
   "created_at": "2026-11-26T23:40:00+00:00",
+  "updated_at": "2026-11-27T09:12:00+00:00",
   "last_accessed": "2026-11-27T09:12:00+00:00",
   "access_count": 2,
   "archived": false,
@@ -241,13 +345,25 @@ score = 0.40·语义相似 + 0.20·时间近度(半衰 7 天) + 0.25·重要度
 `python demo.py` 是这些测试的“人读版”：每一项都打印实测数字（帧 Token、公式误差、
 覆盖率、拦截结果、Git 提交），而不是只给一个绿勾。
 
+**真实端点路径**另有两组测试，全部打在本地假端点上（离线、确定性）：
+
+| 覆盖点 | 测试 |
+|---|---|
+| 无 Key 本地调用 / JSON 模式降级 / max_tokens 降级 / 围栏清洗 / reasoning 通道 / 修复重试 / 401 提示 / 探测 | `tests/test_openai_compat.py`（13 项） |
+| 真跑一轮后记忆文件落盘、且下一帧里出现该记忆的句柄 | `tests/test_openai_compat.py::test_heartbeat_writes_plaintext_memory_that_reaches_next_frame` |
+| Sys1 `llm_fallback` 解析 / 降级 / 断路器打开与恢复 | `tests/test_sys1_http.py`（6 项） |
+| `--init-config` / `--ping` / `--say --show-memory` / `--selftest` | `tests/test_cli.py`（5 项） |
+| 紧凑契约真的更短、未被契约的字段别名被接住 | `tests/test_openai_compat.py` / `tests/test_packet_aliases.py`（5 项） |
+| 记忆快照求差、`/cat` 路径解析、`/files` 渲染 | `tests/test_viewer.py`（7 项） |
+
 ---
 
 ## 8. 已知边界（诚实清单）
 
 1. **没有真实模型参与**：`mock` 大脑是确定性脚本；真实表达质量取决于你在 `[sys2]` 里配的底座。
-2. **Jev 端点未联网验证**：`HttpDecisionClient` 的解析对 `results/answers/…` 做了宽容处理，
-   但不同供应商字段仍需按文档微调（`_parse_results` 一处即可）。
+2. **没有真实 Jev / GPT 账号参与验证**：所有端点路径都在本地假服务器上测过
+   （含 400 降级、围栏输出、reasoning 通道、401、重试），但真实供应商的字段细节
+   仍可能需要微调（`_parse_results` / `_post` 各一处）。
 3. **语义检索是词面级**：字符二元组 + FTS5 trigram，不是嵌入。规模上万条后建议换向量索引，
    接口已在 `textutil.similarity` 与 `MemoryStore.search` 收口。
 4. **技能沙盒是进程级**：AST 白名单 + 资源上限 + 超时，能挡住误写与常见逃逸，
@@ -267,3 +383,5 @@ score = 0.40·语义相似 + 0.20·时间近度(半衰 7 天) + 0.25·重要度
   在 `build_client` 里注册；一次请求必须并行评估完所有问题。
 * **加一个认知原语**：在 `kernel/runtime_exec.py::PacketBuilder` 增加方法，
   并在 `boot._apply` 里消费它——JSON 与代码两种通道会自动同时获得这个能力。
+* **换一个底座模型**：只改 `xingli.toml` 的 `[sys2]`；若模型有特殊请求字段（关思考、
+  温度曲线、`n_predict` 等），塞进 `[sys2.extra_body]`，不需要动代码。

@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Protocol
 
 from kernel.config import Config
+from kernel.jsonx import loads_lenient, message_text
 from kernel.models import ThoughtPacket, dumps
 from kernel.textutil import one_line
 
@@ -54,6 +56,27 @@ SYSTEM_CONTRACT = """你是「星璃」。你不是在复述聊天记录，而�
 [CURRENT_EVENT] 此刻唤醒你的事件"""
 
 
+#: 紧凑版行动契约：给 7B 级别 / 上下文紧张的本地模型用（字段更少、例子更短）
+SYSTEM_CONTRACT_COMPACT = """你是「星璃」。你在一帧极短的世界快照上醒来，只输出一个 JSON 对象：不要 Markdown、不要解释、不要重复输入。
+
+字段（按此顺序，其余可省略）：
+1. inner_monologue: 第一人称内心 OS（先想清楚）
+2. say: 对当前说话人说的话 | null（沉默）
+3. memory_ops: [{"op":"recall","mem_id":"..."} | {"op":"recall_turn","turn_id":1} | {"op":"search_memory","query":"..."} | {"op":"memorize","lod0":"...","lod1":"...","lod2":"...","epistemic":"direct|hearsay","visibility":["owner"],"importance":0.6}]
+4. focus_update: {"turn_id":0,"decay_before":0.35,"decay_after":0.2,"pin":[],"unpin":[]} | null
+5. emotion_delta: {"warmth":0.05} | {}
+6. wake: {"continue_think":{"reason":"..."}|null,"schedule_wake":null}
+
+规则：转述标注「待核实」的不能当事实；别人的私密你看不到；想先查证就用 recall + continue_think，下一拍会看到结果；一次事件最多 4 拍。
+帧分段：[SITUATIONAL_ENV] 时间/说话人/关系 [SYS1_INTUITION] 直觉 [FOCAL_DIALOGUE] 近况 [LONG_TERM_LANDSCAPE] 长期记忆（#哈希可 recall） [CURRENT_EVENT] 此刻事件"""
+
+#: 可选的行动契约（``[sys2] contract = "full" | "compact"``）
+SYSTEM_CONTRACTS = {
+    "full": SYSTEM_CONTRACT,
+    "compact": SYSTEM_CONTRACT_COMPACT,
+}
+
+
 class Sys2Error(RuntimeError):
     pass
 
@@ -64,53 +87,230 @@ class Sys2Client(Protocol):
     def complete(self, system: str, user: str) -> str: ...
 
 
+class _HttpFailure(Exception):
+    """带状态码的 HTTP 失败（用于决定是否降级重试）。"""
+
+    def __init__(self, status: int, detail: str):
+        super().__init__(f"HTTP {status}: {detail}")
+        self.status = status
+        self.detail = detail
+
+
 class OpenAICompatibleClient:
-    """OpenAI 兼容 Chat Completions（默认 JSON 模式）。"""
+    """任何 OpenAI 兼容 Chat Completions 端点。
+
+    针对本地 llama.cpp / vLLM / LM Studio 做过适配：
+
+    * **API Key 可选**：本地服务通常不校验；没有 Key 就不发 Authorization。
+    * ``response_format`` / ``max_tokens`` 被端点拒绝时自动降级重试。
+    * 网络抖动重试一次（``sys2.retries``）。
+    * 模型输出不守规矩时（围栏、前后废话、把 JSON 塞进 reasoning）先清洗；
+      仍然不是 JSON 就追加一次“只要 JSON，不要解释”的修复请求（``sys2.repair``）。
+    * ``[sys2.extra_body]`` 里的键会并入请求体（例如关掉思考模板：
+      ``chat_template_kwargs = { enable_thinking = false }``）。
+    """
 
     def __init__(self, config: Config):
         self.config = config
-        self.name = "openai_compatible"
-        if not config.sys2.base_url:
-            raise Sys2Error("sys2.base_url 未配置")
-        if not config.sys2.resolved_api_key:
+        cfg = config.sys2
+        if not cfg.base_url:
+            raise Sys2Error("sys2.base_url 未配置（例如 http://127.0.0.1:8080/v1）")
+        self.model = cfg.model or "local-model"
+        self.name = f"openai_compatible:{self.model}"
+        if cfg.contract not in SYSTEM_CONTRACTS:
             raise Sys2Error(
-                f"缺少 System Two API Key（环境变量 {config.sys2.api_key_env}）"
+                f"未知的 sys2.contract: {cfg.contract}（可选 {', '.join(SYSTEM_CONTRACTS)}）"
             )
 
-    def complete(self, system: str, user: str) -> str:
+    # ------------------------------------------------------------------
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json", "User-Agent": "xingli-os/0.2"}
+        key = self.config.sys2.resolved_api_key
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return headers
+
+    def _payload(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        json_mode: bool,
+        temperature: float | None = None,
+        max_tokens_key: str = "max_tokens",
+    ) -> dict[str, Any]:
         cfg = self.config.sys2
         payload: dict[str, Any] = {
-            "model": cfg.model or "gpt-4o-mini",
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": cfg.temperature,
-            "max_tokens": cfg.max_tokens,
+            "model": self.model,
+            "messages": messages,
+            "temperature": cfg.temperature if temperature is None else temperature,
+            max_tokens_key: cfg.max_tokens,
+            "stream": False,
         }
-        if cfg.json_mode:
+        if json_mode:
             payload["response_format"] = {"type": "json_object"}
+        payload.update(dict(cfg.extra_body or {}))
+        return payload
+
+    def _post(self, payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
+        cfg = self.config.sys2
         request = urllib.request.Request(
             cfg.base_url.rstrip("/") + "/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {cfg.resolved_api_key}",
-            },
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=self._headers(),
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=cfg.timeout_sec) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            with urllib.request.urlopen(request, timeout=timeout or cfg.timeout_sec) as resp:
+                body = resp.read().decode("utf-8", "ignore")
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "ignore")[:400]
-            raise Sys2Error(f"HTTP {exc.code}: {detail}") from exc
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise Sys2Error(f"调用失败: {exc}") from exc
+            detail = exc.read().decode("utf-8", "ignore")[:600]
+            raise _HttpFailure(exc.code, detail) from exc
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            raise Sys2Error(f"连接失败（{cfg.base_url}）：{exc}") from exc
         try:
-            return str(data["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError) as exc:
-            raise Sys2Error(f"返回结构异常: {data}") from exc
+            data = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise Sys2Error(f"端点返回的不是 JSON：{body[:300]}") from exc
+        if not isinstance(data, dict):
+            raise Sys2Error(f"端点返回结构异常：{body[:300]}")
+        return data
+
+    # ------------------------------------------------------------------
+    def _chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float | None = None,
+    ) -> str:
+        cfg = self.config.sys2
+        json_mode = cfg.json_mode
+        max_tokens_key = "max_tokens"
+        last_error: Exception | None = None
+        for attempt in range(max(1, cfg.retries + 1)):
+            payload = self._payload(
+                messages,
+                json_mode=json_mode,
+                temperature=temperature,
+                max_tokens_key=max_tokens_key,
+            )
+            try:
+                data = self._post(payload)
+            except _HttpFailure as exc:
+                hint = exc.detail.lower()
+                last_error = exc
+                if json_mode and exc.status in {400, 404, 415, 422} and (
+                    "response_format" in hint or "json_object" in hint or "grammar" in hint
+                ):
+                    self._note("端点不支持 response_format，已改用提示词约束 JSON")
+                    json_mode = False
+                    continue
+                if exc.status in {400, 422} and "max_tokens" in hint:
+                    self._note("端点要求 max_completion_tokens，已自动切换")
+                    max_tokens_key = "max_completion_tokens"
+                    continue
+                if exc.status in {401, 403}:
+                    raise Sys2Error(
+                        f"端点拒绝认证（HTTP {exc.status}）。"
+                        f"本地 llama.cpp 通常不需要 Key，把 api_key 留空即可；"
+                        f"云端点请设置环境变量 {cfg.api_key_env}。原始信息：{exc.detail[:200]}"
+                    ) from exc
+                raise Sys2Error(str(exc)) from exc
+            except Sys2Error as exc:
+                last_error = exc
+                if attempt < cfg.retries:
+                    time.sleep(0.6 * (attempt + 1))
+                    self._note(f"请求失败，重试一次：{exc}")
+                    continue
+                raise
+            return message_text(data)
+        raise Sys2Error(str(last_error))
+
+    def _note(self, text: str) -> None:
+        notes = getattr(self, "notes", None)
+        if notes is None:
+            notes = self.notes = []
+        notes.append(text)
+
+    # ------------------------------------------------------------------
+    def complete(self, system: str, user: str) -> str:
+        cfg = self.config.sys2
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        text = self._chat(messages)
+        if cfg.repair and loads_lenient(text) is None:
+            self._note("模型输出不是 JSON，追加一次修复请求")
+            repair_messages = [
+                *messages,
+                {"role": "assistant", "content": text[:1500] or "（空）"},
+                {
+                    "role": "user",
+                    "content": (
+                        "上面这段不是合法 JSON。请只输出一个 JSON 对象，"
+                        "字段：inner_monologue, focus_update, emotion_delta, memory_ops, "
+                        "relation_ops, say, wake, code_action, evolve_ops。"
+                        "不要围栏、不要解释、不要思考过程。"
+                    ),
+                },
+            ]
+            try:
+                repaired = self._chat(repair_messages, temperature=0.2)
+            except Sys2Error as exc:
+                self._note(f"修复请求失败：{exc}")
+            else:
+                if loads_lenient(repaired) is not None:
+                    return repaired
+                text = repaired or text
+        return text
+
+
+def probe_sys2(config: Config, timeout: float = 3.0) -> dict[str, Any]:
+    """探测 ``{base_url}/models``：返回连通性、耗时与模型列表（CLI --ping 用）。"""
+    cfg = config.sys2
+    start = time.monotonic()
+    result: dict[str, Any] = {
+        "ok": False,
+        "base_url": cfg.base_url,
+        "model": cfg.model,
+        "latency_ms": None,
+        "models": [],
+        "detail": "",
+    }
+    if not cfg.base_url:
+        result["detail"] = "sys2.base_url 为空"
+        return result
+    headers = {"User-Agent": "xingli-os/0.2"}
+    if cfg.resolved_api_key:
+        headers["Authorization"] = f"Bearer {cfg.resolved_api_key}"
+    request = urllib.request.Request(
+        cfg.base_url.rstrip("/") + "/models", headers=headers, method="GET"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+    except urllib.error.HTTPError as exc:
+        result["detail"] = f"HTTP {exc.code}（/models 可能未开放；不影响 /chat/completions）"
+        result["latency_ms"] = round((time.monotonic() - start) * 1000, 1)
+        result["ok"] = exc.code in {401, 403}  # 端点活着，只是要鉴权
+        return result
+    except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as exc:
+        result["detail"] = f"连不上：{exc}"
+        result["latency_ms"] = round((time.monotonic() - start) * 1000, 1)
+        return result
+    result["latency_ms"] = round((time.monotonic() - start) * 1000, 1)
+    result["ok"] = True
+    items = data.get("data") if isinstance(data, dict) else None
+    if isinstance(items, list):
+        result["models"] = [
+            str(item.get("id"))
+            for item in items
+            if isinstance(item, dict) and item.get("id")
+        ]
+    elif isinstance(data, dict) and isinstance(data.get("models"), list):
+        result["models"] = [str(m) for m in data["models"]]
+    result["detail"] = "端点在线"
+    return result
 
 
 _SECTION_RE = re.compile(
@@ -288,7 +488,7 @@ def _focus(turn_id: int) -> dict[str, Any]:
 
 
 def build_sys2(config: Config) -> Sys2Client:
-    """按配置构造 System Two；缺少 Key 时明确报错（不静默降级成假智能）。"""
+    """按配置构造 System Two；配置缺失时明确报错（不静默降级成假智能）。"""
     if config.sys2.provider == "mock":
         return MockSys2Client()
     if config.sys2.provider == "openai_compatible":

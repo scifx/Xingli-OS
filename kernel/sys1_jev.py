@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ from datetime import datetime
 from typing import Any, Iterable, Mapping, Protocol
 
 from kernel.config import Config, Sys1Config
+from kernel.jsonx import loads_lenient, message_text
 from kernel.literal import load_literal
 from kernel.models import ReflexSignal, clamp, iso, now_utc, parse_iso
 from kernel.paths import Workspace
@@ -178,15 +180,13 @@ class LocalLexiconClient:
 # HTTP 适配器（Jev / OpenAI Decisions / LLM 降级）
 # ---------------------------------------------------------------------------
 def _post_json(url: str, payload: dict[str, Any], api_key: str, timeout: float) -> dict[str, Any]:
-    data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json", "User-Agent": "xingli-os/0.2"}
+    if api_key:  # 本地 llama.cpp 通常不校验 Key
+        headers["Authorization"] = f"Bearer {api_key}"
     request = urllib.request.Request(
         url,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "xingli-os/0.1",
-        },
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
         method="POST",
     )
     try:
@@ -312,8 +312,7 @@ class HttpDecisionClient:
         self.name = config.provider
         if not config.base_url:
             raise Sys1Error("sys1.base_url 未配置")
-        if not config.resolved_api_key:
-            raise Sys1Error(f"缺少 API Key（环境变量 {config.api_key_env}）")
+        # 本地 Jev / llama.cpp 可能不校验 Key：没有 Key 也能连
 
     def _url(self) -> str:
         base = self.config.base_url.rstrip("/")
@@ -335,7 +334,12 @@ class HttpDecisionClient:
 
 
 class LLMFallbackClient:
-    """用轻量生成式模型模拟概率输出（无 Jev Key 但有一个普通 LLM Key 时）。"""
+    """用普通聊天模型模拟概率输出（任何 OpenAI 兼容端点，含本地 llama.cpp）。
+
+    与 ``jev`` 的区别：不需要 ``/v1/systemone`` 这种专用结构，只发一次
+    chat/completions 并让它返回 ``{"results": {...}}``。适合“我的 Jev 其实
+    只是个 OpenAI 兼容端点”的场景。
+    """
 
     name = "llm_fallback"
 
@@ -343,8 +347,29 @@ class LLMFallbackClient:
         self.config = config
         if not config.base_url:
             raise Sys1Error("sys1.base_url 未配置")
-        if not config.resolved_api_key:
-            raise Sys1Error(f"缺少 API Key（环境变量 {config.api_key_env}）")
+
+    def _payload(self, prompt: str, json_mode: bool) -> dict[str, Any]:
+        cfg = self.config
+        payload: dict[str, Any] = {
+            "model": cfg.model or "local-model",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是模糊感知器。阅读 STATE，对每个问题给出校准后的概率/分布/打分。"
+                        "只输出 JSON 对象，形如 {\"results\": {\"<id>\": {...}}}，不要解释。"
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens": cfg.max_tokens,
+            "stream": False,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        payload.update(dict(cfg.extra_body or {}))
+        return payload
 
     def fan_out(self, state: str, specs: list[QuestionSpec]) -> dict[str, DecisionResult]:
         schema = {
@@ -354,49 +379,88 @@ class LLMFallbackClient:
             for s in specs
         }
         prompt = (
-            "你是模糊感知器。阅读 STATE，对每个问题给出校准后的概率/分布/打分。"
-            "只输出 JSON，形如 {\"results\": {\"<id>\": {...}}}，不要解释。\n"
             f"问题与期望字段: {json.dumps([s.to_payload() for s in specs], ensure_ascii=False)}\n"
             f"字段模板: {json.dumps(schema, ensure_ascii=False)}\n"
             f"STATE:\n{state[:4000]}"
         )
-        payload = {
-            "model": self.config.model or "gpt-4o-mini",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.0,
-            "response_format": {"type": "json_object"},
-        }
-        data = _post_json(
-            self.config.base_url.rstrip("/") + "/chat/completions",
-            payload,
-            self.config.resolved_api_key,
-            self.config.timeout_sec,
-        )
+        url = self.config.base_url.rstrip("/") + "/chat/completions"
+        json_mode = True
         try:
-            content = data["choices"][0]["message"]["content"]
-            inner = json.loads(content)
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise Sys1Error(f"LLM 降级返回不可解析: {exc}") from exc
-        if isinstance(inner, dict) and "results" not in inner:
+            data = _post_json(
+                url,
+                self._payload(prompt, json_mode),
+                self.config.resolved_api_key,
+                self.config.timeout_sec,
+            )
+        except Sys1Error as exc:
+            if "response_format" not in str(exc).lower() and "json_object" not in str(exc).lower():
+                raise
+            json_mode = False
+            data = _post_json(
+                url,
+                self._payload(prompt, json_mode),
+                self.config.resolved_api_key,
+                self.config.timeout_sec,
+            )
+        content = message_text(data)
+        inner = loads_lenient(content) if content else None
+        if inner is None:
+            raise Sys1Error(f"LLM 降级返回不可解析: {content[:160]!r}")
+        if isinstance(inner, list):
+            inner = {"answers": inner}
+        if isinstance(inner, dict) and "results" not in inner and "answers" not in inner:
+            # 有些模型会直接返回 {id: {...}}
             inner = {"results": inner}
         return _parse_results(inner, specs)
 
 
 class ChainClient:
-    """主适配器失败时自动降级（例如 Jev 超时 → 离线词法），保证一拍不卡死。"""
+    """主适配器失败时自动降级（例如 Jev 超时 → 离线词法），保证一拍不卡死。
 
-    def __init__(self, primary: Sys1Client, fallback: Sys1Client):
+    连续失败 ``max_failures`` 次后打开断路器：接下来 ``cooldown_sec`` 秒内
+    直接走本地词法，不再为每一拍白等一次超时；冷却结束后自动试探恢复。
+    """
+
+    def __init__(
+        self,
+        primary: Sys1Client,
+        fallback: Sys1Client,
+        *,
+        max_failures: int = 2,
+        cooldown_sec: float = 60.0,
+        now_fn=time.monotonic,
+    ):
         self.primary = primary
         self.fallback = fallback
         self.name = f"{getattr(primary, 'name', 'primary')}->{getattr(fallback, 'name', 'fallback')}"
+        self.max_failures = max_failures
+        self.cooldown_sec = cooldown_sec
+        self.now_fn = now_fn
+        self.failures = 0
+        self.open_until = 0.0
         self.last_error: str | None = None
 
+    @property
+    def circuit_open(self) -> bool:
+        return self.failures >= self.max_failures and self.now_fn() < self.open_until
+
     def fan_out(self, state: str, specs: list[QuestionSpec]) -> dict[str, DecisionResult]:
+        if self.circuit_open:
+            self.last_error = (
+                f"断路器打开中（再等 {self.open_until - self.now_fn():.0f}s）：{self.last_error or ''}"
+            )
+            return self.fallback.fan_out(state, specs)
         try:
-            return self.primary.fan_out(state, specs)
+            result = self.primary.fan_out(state, specs)
         except Exception as exc:  # noqa: BLE001 - 降级是有意为之
             self.last_error = f"{type(exc).__name__}: {exc}"
+            self.failures += 1
+            if self.failures >= self.max_failures:
+                self.open_until = self.now_fn() + self.cooldown_sec
             return self.fallback.fan_out(state, specs)
+        self.failures = 0
+        self.open_until = 0.0
+        return result
 
 
 def build_client(config: Config) -> Sys1Client:

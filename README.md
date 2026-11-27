@@ -219,16 +219,51 @@ chat messages 数组是“被关在鹦鹉螺壳里”的感官剥夺：超过数
 | **M3 社会化与隐私墙** | relations · visibility 物理过滤 · direct/hearsay 溯源 · teach_rule | A 的私密记忆对 B 物理不存在；B 的转述只以待核实线索呈现；教导下一轮生效 |
 | **M4 受控自进化** | sandbox（AST+子进程回归）· Git 账本 · sleep_cycle（LOD 蒸馏+反失忆抽查） | 合法提案自动提交；恶意提案 100% 拦截 + 免疫记忆；`/sleep` 后反失忆抽查通过 |
 
-### 快速开始（离线，不需要任何 API Key）
+### 快速开始：接本地 llama.cpp（推荐，不需要任何云端 Key）
+
+```bash
+# 0) 先起一个本地模型（任何 GGUF 都行）
+llama-server -m qwen2.5-7b-instruct-q4_k_m.gguf -c 8192 --port 8080
+
+# 1) 生成配置（会把 base_url / model 写进 xingli.toml）
+python cli.py --init-config --base-url http://127.0.0.1:8080/v1 \
+              --model qwen2.5-7b-instruct-q4_k_m
+# 7B 级别的小模型建议加 --contract compact（系统契约 683 → 327 tokens，更听话）
+
+python cli.py --ping        # 端点在线吗？模型名对得上吗？
+python cli.py --selftest    # 真跑一轮：认知包解析 + 新建的记忆文件原样打印
+python cli.py               # 开始聊
+```
+
+聊起来之后，每一轮结束都会打印 **记忆文件的变化**：
+
+```
+星璃: 记下了，下周三我不给你排别的事。
+  ⟨计时⟩ 8.4s · 1 拍 · 帧 1037 tokens
+  │ 记忆变化 · 新建 2 · 更新 0 · +1.7KB
+  │   + episodes/f9b67852df8a.json  714B  〔direct·重要0.85·可见 owner〕
+  │         「下周三上午看牙医（别排别的事）」
+  │   + turns/000002.json  996B
+  │   ~ 状态：emotion.json, reflex_state.json, turn_counter.json
+```
+
+想看文件本身：`/cat f9b67852df8a`（原始明文 JSON）、`/files`（长期记忆清单）、
+`/tree`（目录占用）、`/status`（端点探测 / 预算 / 统计）。记忆排序是
+`id → lod0 → lod1 → lod2 → 来源/认识论/可见性 → 时间`，自上而下就是“她记住了什么”。
+
+> 端点无论叫 OpenAI 还是 Jev，只要是 OpenAI 兼容的 `/chat/completions`，都能直接接：
+> System Two 用 `[sys2] provider = "openai_compatible"`；System One 若要真调模型，
+> 用 `[sys1] provider = "llm_fallback"`（真 Jev 的 `/v1/systemone` 用 `"jev"`）。
+> 本地服务通常不校验 Key，`api_key` 留空即可。
+
+### 离线跑（不需要任何端点）
 
 ```bash
 python demo.py          # 50 项机制验证：帧长、公式误差、隐私墙、拦截率……都打印实测数字
-python -m pytest -q     # 57 项自动化测试
-python cli.py --mock    # CLI 聊天台：/as 换人 /frame 看帧 /focus 看视距 /sleep /log /rollback
+python -m pytest -q     # 96 项自动化测试（含假端点上的真实协议测试）
+python cli.py --mock    # mock 大脑：/as 换人 /frame 看帧 /focus 看视距 /sleep /log /rollback
 ```
 
-接真实模型：`cp config.example.toml xingli.toml`，把 `[sys2] provider` 改为
-`openai_compatible` 并设置 `XINGLI_SYS2_KEY`；有 Jev Key 时同法切换 `[sys1]`。
 实现口径、与 SPEC 的偏差、六条铁律的代码落点，见 [`IMPLEMENTATION.md`](./IMPLEMENTATION.md)。
 
 规格与验收原样保留在 [`XINGLI_OS_SPEC.md`](./XINGLI_OS_SPEC.md)（数据契约、公式、目录结构、铁律与 pytest 验收标准）；
@@ -240,7 +275,7 @@ python cli.py --mock    # CLI 聊天台：/as 换人 /frame 看帧 /focus 看视
 
 - 架构、数据契约、验收标准：**完成**（SPEC + MIT）
 - 早期验证实验：v1 轶事有效，**无受控数据**
-- 实现：**M1–M4 核心闭环已落地**（纯标准库 Python；57 项 pytest + 50 项离线机制验证，`python demo.py` 可复现）
+- 实现：**M1–M4 核心闭环已落地**（纯标准库 Python；96 项 pytest（含 26 项打在假端点上的真实协议测试）+ 50 项离线机制验证，`python demo.py` 可复现）
 - 离线机制验证（mock 大脑，不是真实模型）：60 轮后认知帧 1492 tokens（预算 6000）且不随轮数增长 · 焦点 LOD 公式误差 0 · A 的私密在 B 的帧中物理不存在 · 恶意进化提案 100% 拦截并沉淀免疫记忆 · 反失忆抽查 67% → 100%
 - 仍未验证：真实底座模型的表达质量、真实 Jev 端点的语义准确率、任何 benchmark
 - 基准 / 第三方评测：**无**

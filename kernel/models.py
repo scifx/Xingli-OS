@@ -47,9 +47,14 @@ def parse_iso(value: str) -> datetime:
     return dt
 
 
-def dumps(obj: Any) -> str:
-    """稳定、可读的 JSON 序列化（写入磁盘的唯一格式）。"""
-    return json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True)
+def dumps(obj: Any, *, sort_keys: bool = False) -> str:
+    """稳定、可读的 JSON 序列化（写入磁盘的唯一格式）。
+
+    默认保持字段的声明顺序（``id`` → ``lod0`` → ``lod1`` …），因为记忆文件是
+    给人看的：先看到"她记住了什么"，再看元数据。需要逐字节稳定对比的场景
+    可以显式 ``sort_keys=True``。
+    """
+    return json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=sort_keys)
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -310,6 +315,41 @@ class WakeSpec:
         }
 
 
+#: 小模型常见的字段别名：契约里的名字优先，别名只用于“接住”而非放宽校验
+PACKET_ALIASES: dict[str, tuple[str, ...]] = {
+    "inner_monologue": ("monologue", "thought", "thinking", "inner_voice", "inner"),
+    "focus_update": ("focus",),
+    "emotion_delta": ("emotion", "feelings", "mood"),
+    "memory_ops": ("memories", "memory"),
+    "relation_ops": ("relations",),
+    "say": ("reply", "response", "answer", "message", "text"),
+    "wake": ("wake_up", "next_tick"),
+    "code_action": ("code", "python"),
+    "evolve_ops": ("evolve", "evolutions"),
+}
+
+
+def _unwrap_packet(d: Mapping[str, Any]) -> tuple[Mapping[str, Any], str]:
+    """模型偶尔把认知包包在 ``{"thought_packet": {...}}`` 之类的壳里。"""
+    canonical = set(PACKET_ALIASES) | {"parse_warnings"}
+    if canonical & set(d):
+        return d, ""
+    if len(d) == 1:
+        (key, value), = d.items()
+        if isinstance(value, Mapping):
+            return value, f"输出被包在「{key}」里，已解包"
+    return d, ""
+
+
+def _pick(d: Mapping[str, Any], field: str) -> tuple[Any, str]:
+    if d.get(field) is not None:
+        return d[field], ""
+    for alias in PACKET_ALIASES.get(field, ()):
+        if d.get(alias) is not None:
+            return d[alias], f"字段别名 {alias}→{field}（模型未按契约命名）"
+    return None, ""
+
+
 @dataclass
 class ThoughtPacket:
     """单拍认知包。字段顺序即 Schema 顺序：inner_monologue 必须第一。"""
@@ -338,12 +378,21 @@ class ThoughtPacket:
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "ThoughtPacket":
         warnings: list[str] = []
-        monologue = d.get("inner_monologue")
+        d, unwrap_note = _unwrap_packet(d)
+        if unwrap_note:
+            warnings.append(unwrap_note)
+
+        monologue, note = _pick(d, "inner_monologue")
+        if note:
+            warnings.append(note)
         if not isinstance(monologue, str):
             warnings.append("inner_monologue 缺失或非字符串，已置空")
             monologue = str(monologue or "")
 
-        delta_raw = d.get("emotion_delta") or {}
+        delta_raw, note = _pick(d, "emotion_delta")
+        if note:
+            warnings.append(note)
+        delta_raw = delta_raw or {}
         delta: dict[str, float] = {}
         if isinstance(delta_raw, Mapping):
             for k, v in delta_raw.items():
@@ -354,44 +403,64 @@ class ThoughtPacket:
         else:
             warnings.append("emotion_delta 不是对象，已忽略")
 
-        ops = d.get("memory_ops") or []
+        ops, note = _pick(d, "memory_ops")
+        if note:
+            warnings.append(note)
+        ops = ops or []
+        if isinstance(ops, Mapping):
+            warnings.append("memory_ops 是对象而不是数组，已包成单元素数组")
+            ops = [ops]
         if not isinstance(ops, list):
             warnings.append("memory_ops 不是数组，已忽略")
             ops = []
         memory_ops = [dict(op) for op in ops if isinstance(op, Mapping)]
 
-        rel_ops = d.get("relation_ops") or []
+        rel_ops, note = _pick(d, "relation_ops")
+        if note:
+            warnings.append(note)
+        rel_ops = rel_ops or []
+        if isinstance(rel_ops, Mapping):
+            rel_ops = [rel_ops]
         if not isinstance(rel_ops, list):
             warnings.append("relation_ops 不是数组，已忽略")
             rel_ops = []
         relation_ops = [dict(op) for op in rel_ops if isinstance(op, Mapping)]
 
-        evo = d.get("evolve_ops") or []
+        evo, note = _pick(d, "evolve_ops")
+        if note:
+            warnings.append(note)
+        evo = evo or []
+        if isinstance(evo, Mapping):
+            evo = [evo]
         if not isinstance(evo, list):
             warnings.append("evolve_ops 不是数组，已忽略")
             evo = []
         evolve_ops = [dict(op) for op in evo if isinstance(op, Mapping)]
 
-        say = d.get("say")
+        say, note = _pick(d, "say")
+        if note:
+            warnings.append(note)
         if isinstance(say, Mapping):
             say = {"to": say.get("to"), "text": str(say.get("text", ""))}
         elif say is not None and not isinstance(say, str):
             warnings.append("say 类型非法，已忽略")
             say = None
 
-        code_action = d.get("code_action")
+        code_action, note = _pick(d, "code_action")
+        if note:
+            warnings.append(note)
         if code_action is not None and not isinstance(code_action, str):
             warnings.append("code_action 非字符串，已忽略")
             code_action = None
 
         return cls(
             inner_monologue=monologue.strip(),
-            focus_update=FocusUpdate.from_dict(d.get("focus_update")),
+            focus_update=FocusUpdate.from_dict(_pick(d, "focus_update")[0]),
             emotion_delta=delta,
             memory_ops=memory_ops,
             relation_ops=relation_ops,
             say=say,
-            wake=WakeSpec.from_dict(d.get("wake")),
+            wake=WakeSpec.from_dict(_pick(d, "wake")[0]),
             code_action=code_action,
             evolve_ops=evolve_ops,
             parse_warnings=warnings,

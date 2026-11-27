@@ -149,3 +149,16 @@ def test_frame_tokens_stay_below_budget_with_many_memories(hb):
     assert frame.total_tokens <= hb.config.budget.frame_tokens
     assert frame.landscape.level_counts()["LOD0"] > 0
     assert estimate_tokens(frame.user) < hb.config.budget.frame_tokens
+
+
+def test_memory_file_key_order_is_human_readable(ws):
+    """记忆文件是给人看的：id → lod0 → lod1 → lod2 必须在前。"""
+    import json
+
+    store = MemoryStore(ws)
+    node = store.put(lod0="可读的顺序", lod1="要点", lod2="全文", source_id="owner")
+    data = json.loads((ws.episodes / f"{node.id}.json").read_text(encoding="utf-8"))
+    keys = list(data)
+    assert keys[0] == "id"
+    assert keys.index("lod0") < keys.index("lod1") < keys.index("lod2")
+    assert keys.index("lod2") < keys.index("source_id") < keys.index("created_at")

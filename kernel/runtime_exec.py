@@ -20,11 +20,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any
 
+from kernel.jsonx import strip_fences
 from kernel.models import ThoughtPacket
-
-import re
-
-_FENCE = re.compile(r"```(?:python|py|json)?\s*(.*?)```", re.DOTALL)
 
 
 class CodeRejected(PermissionError):
@@ -391,15 +388,6 @@ def extract_comments(code: str) -> str:
             if text:
                 lines.append(text)
     return "\n".join(lines)
-
-
-def strip_fences(text: str) -> str:
-    if not text:
-        return ""
-    m = _FENCE.search(text)
-    if m:
-        return m.group(1).strip()
-    return text.strip()
 
 
 def execute_python(
