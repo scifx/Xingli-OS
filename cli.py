@@ -12,6 +12,10 @@
     /cat <id|路径>     直接看某条记忆的原始 JSON（记忆文件长什么样）
     /tree              cortex/ 的目录树与占用
     /prefill on|off    预填 JSON 开头（思考型模型不肯按格式输出时的杀手锏）
+    /sys1             丘脑（System One）状态 + 活体探测
+    /sys1 on <模型>   用本地决策模型当丘脑（立刻生效，并写进 xingli.toml）
+    /sys1 off         退回本地词法
+    /forget <id>      作废一条记忆（只归档，文件与账本都留着）
     /status            端点连通性、模型、Token 预算与记忆统计
     /as <speaker_id>   切换当前说话人（测试隐私墙与社交反哺）
     /who               当前说话人与其关系档案
@@ -40,10 +44,13 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 import threading
 import time
+import traceback
+from dataclasses import replace
 from pathlib import Path
 
 import viewer
@@ -51,6 +58,7 @@ from kernel.boot import Heartbeat
 from kernel.config import Config
 from kernel.git_ledger import LedgerError
 from kernel.paths import Workspace
+from kernel.sys1_jev import build_client as build_sys1_client
 from kernel.sys2_llm import Sys2Error, probe_sys2
 
 BANNER = """\
@@ -59,7 +67,40 @@ BANNER = """\
 │ 输入 /help 看指令；直接说话即可。                              │
 └──────────────────────────────────────────────────────────────┘"""
 
-THINKING_HINT = "  … 星璃在想（本地模型可能慢，稍等）"
+THINKING_HINT = "  … 星璃在想（本地模型可能慢，稍等；这时你也可以直接打字，我收尾后立刻接）"
+
+
+class _InputPump(threading.Thread):
+    """后台读 stdin。
+
+    这样“她在想”的那几十秒里你也能打字：主循环每 0.25s 收一次输入，
+    既能把下一句排进队列，也能当成“别自转了，主人插话了”的刹车信号。
+    """
+
+    def __init__(self, stream=sys.stdin) -> None:
+        super().__init__(daemon=True, name="xingli-stdin")
+        self.stream = stream
+        self._lines: list[str] = []
+        self._lock = threading.Lock()
+        self.closed = False
+
+    def run(self) -> None:  # pragma: no cover - 交互线程
+        try:
+            for line in self.stream:
+                with self._lock:
+                    self._lines.append(line.rstrip("\r\n"))
+        except Exception:  # noqa: BLE001 - 关窗 / Ctrl-C
+            pass
+        finally:
+            self.closed = True
+
+    def take(self) -> str | None:
+        with self._lock:
+            return self._lines.pop(0) if self._lines else None
+
+    def pending(self) -> bool:
+        with self._lock:
+            return bool(self._lines)
 
 
 class ChatCLI:
@@ -80,6 +121,11 @@ class ChatCLI:
         self.config_path = config_path
         self.mode_stats: dict[str, int] = {}
         self.running = True
+        self.pump: _InputPump | None = None
+        #: 她在想的时候你打的字：按顺序排队，收尾后照原顺序处理
+        self.queue: list[str] = []
+        self._prompt_shown = False
+        self._busy = False
         # 聊天与自主唤醒串行执行（避免并发写记忆）；线程用 daemon，
         # 这样在等模型时按 Ctrl-C 能立刻退出，不会被 atexit join 卡住。
         self._lock = threading.Lock()
@@ -139,8 +185,15 @@ class ChatCLI:
                 if tick.packet and tick.packet.inner_monologue:
                     for line in tick.packet.inner_monologue.splitlines():
                         print(f"  # {line}")
+                seen: set[str] = set()
                 for warn in tick.actions.errors:
-                    print(f"  ⟨内核⟩ {warn}")
+                    if warn and warn not in seen:
+                        seen.add(warn)
+                        print(f"  ⟨内核⟩ {warn}")
+                for note in getattr(tick.actions, "notes", []):
+                    if note and note not in seen:
+                        seen.add(note)
+                        print(f"  ⟨记忆⟩ {note}")
                 for evo in tick.actions.evolutions:
                     mark = "✓" if evo.get("ok") else "✗"
                     print(f"  ⟨进化{mark}⟩ {evo.get('message')}")
@@ -158,9 +211,11 @@ class ChatCLI:
             rate, generated = self._gen_stats()
             extra = f" · 出 {generated} tok" if generated else ""
             extra += f" · {rate:.1f} tok/s" if rate else ""
+            total_sys1 = sum(t.sys1_ms for t in result.ticks)
             print(
                 f"  ⟨计时⟩ {total_ms / 1000:.1f}s · {len(result.ticks)} 拍 · "
                 f"帧 {last.frame_tokens} tokens{extra}"
+                + (f" · 丘脑 {total_sys1:.0f}ms" if total_sys1 >= 1 else "")
             )
             for tick in result.ticks:
                 if tick.mode and tick.mode != "json":
@@ -177,12 +232,21 @@ class ChatCLI:
     # ------------------------------------------------------------------
     async def _poll_wakes(self) -> None:
         while self.running:
+            if self._busy:
+                # 正在聊就别插播主动唤醒：既避免抢锁，也避免对话被劈成两半
+                await asyncio.sleep(0.5)
+                continue
             baseline = viewer.snapshot(self.ws.cortex) if self.show_memory else None
             try:
-                results = await self._call(self._serialized, self.hb.poll_wakes)
+                self._busy = True
+                results = await self._run_call(
+                    self.hb.poll_wakes, None, self._interrupt
+                )
             except Exception as exc:  # noqa: BLE001
                 print(f"⟨调度器异常⟩ {type(exc).__name__}: {exc}")
                 results = []
+            finally:
+                self._busy = False
             for result in results:
                 reason = result.event.extra.get("reason", "")
                 print(f"\n（星璃主动开口 · {reason or '自主唤醒'}）")
@@ -190,24 +254,16 @@ class ChatCLI:
                 self._print_result(result, baseline)
             await asyncio.sleep(0.5)
 
-    async def _read(self, prompt: str) -> str | None:
-        print(prompt, end="", flush=True)
-        try:
-            line = await asyncio.get_running_loop().run_in_executor(None, sys.stdin.readline)
-        except Exception:  # noqa: BLE001
-            return None
-        if line == "":
-            return None
-        return line.rstrip("\n")
-
     # ------------------------------------------------------------------
     async def run(self) -> None:
         print(BANNER)
         print(self._banner_context())
+        self.pump = _InputPump()
+        self.pump.start()
         poller = asyncio.create_task(self._poll_wakes())
         try:
             while self.running:
-                line = await self._read(f"{self.speaker}> ")
+                line = await self._read_line()
                 if line is None:
                     print("\n（再见）")
                     break
@@ -217,27 +273,217 @@ class ChatCLI:
                 if line.startswith("/"):
                     await self._command(line)
                     continue
-                baseline = viewer.snapshot(self.ws.cortex) if self.show_memory else None
-                print(THINKING_HINT, end="", flush=True)
-                try:
-                    result = await self._call(
-                        self._serialized, self.hb.handle_message, self.speaker, line
-                    )
-                except Sys2Error as exc:
-                    self._clear_hint()
-                    print(f"⟨端点错误⟩ {exc}")
-                    continue
-                finally:
-                    self._clear_hint()
-                self._count_modes(result)
-                self._print_result(result, baseline)
+                await self._turn(line)
         finally:
             self.running = False
             poller.cancel()
 
+    # ------------------------------------------------------------------
+    def _interrupt(self) -> bool:
+        """给她一个刹车信号：主人已经在排队说下一句了。"""
+        return bool(self.queue)
+
+    def _absorb_input(self) -> None:
+        """把后台读到的行搬进队列（等模型的间隙调用）。"""
+        if self.pump is None:
+            return
+        while True:
+            line = self.pump.take()
+            if line is None:
+                return
+            line = line.strip()
+            if not line:
+                continue
+            self.queue.append(line)
+            print(f"\n  … 收下了（这一拍收尾就处理）：{line[:40]}")
+
+    async def _read_line(self) -> str | None:
+        if not self._prompt_shown:
+            print(f"{self.speaker}> ", end="", flush=True)
+            self._prompt_shown = True
+        while self.running:
+            if self.queue:
+                print()
+                self._prompt_shown = False
+                return self.queue.pop(0)
+            line = self.pump.take() if self.pump else None
+            if line is not None:
+                self._prompt_shown = False
+                return line
+            if self.pump is not None and self.pump.closed:
+                return None
+            await asyncio.sleep(0.05)
+        return None
+
+    async def _run_call(self, fn, *args):
+        """跑一次阻塞调用，同时保持输入可读（并把插话变成刹车信号）。"""
+        task = asyncio.create_task(self._call(self._serialized, fn, *args))
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=0.25)
+            self._absorb_input()
+            if task.done():
+                return task.result()
+
+    async def _turn(self, line: str) -> None:
+        baseline = viewer.snapshot(self.ws.cortex) if self.show_memory else None
+        print(THINKING_HINT, end="", flush=True)
+        self._busy = True
+        try:
+            result = await self._run_call(
+                self.hb.handle_message, self.speaker, line, self._interrupt
+            )
+        except Sys2Error as exc:
+            print(f"\n⟨端点错误⟩ {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001 - 一拍崩了不该带走整个聊天
+            print(f"\n⟨这一拍出了异常，聊天还在⟩ {type(exc).__name__}: {exc}")
+            if os.environ.get("XINGLI_TRACEBACK"):
+                traceback.print_exc()
+            return
+        finally:
+            self._busy = False
+            self._clear_hint()
+        self._count_modes(result)
+        self._print_result(result, baseline)
+
     @staticmethod
     def _clear_hint() -> None:
         print("\r" + " " * 48 + "\r", end="", flush=True)
+
+    # ------------------------------------------------------------------
+    # System One（丘脑）诊断
+    # ------------------------------------------------------------------
+    def _sys1_banner(self) -> str:
+        cfg = self.hb.config
+        client = self.hb.reflex.client
+        name = getattr(client, "name", "?")
+        body = f"System One：{name}"
+        if cfg.sys1.provider == "local" or not cfg.sys1.base_url:
+            body += "（本地词法；想用本地决策模型：/sys1 on Kev-4B-GGUF）"
+        elif "->" not in name:
+            body += "  ⚠ 配置了端点但没能接上，已退回本地词法（/sys1 看原因）"
+        else:
+            body += f"  ← {cfg.sys1.base_url}（{cfg.sys1.model or '?'}，{cfg.sys1.timeout_sec}s）"
+        return body
+
+    def _probe_sys1(self) -> tuple[bool, str]:
+        """真发一次丘脑请求：接上了吗？多快？退回本地词法没有？"""
+        from kernel.sys1_jev import BASE_PERCEPTIONS
+
+        client = self.hb.reflex.client
+        state = (
+            "说话人: 主人(owner) 关系:owner 亲密度0.85\n"
+            "时间: 现在 情绪余温: 平静\n内容: 你好，我叫 lucky，记住我喜欢菠萝。"
+        )
+        started = time.monotonic()
+        try:
+            results = client.fan_out(state, BASE_PERCEPTIONS[:2])
+        except Exception as exc:  # noqa: BLE001
+            return False, f"{type(exc).__name__}: {exc}"
+        ms = (time.monotonic() - started) * 1000
+        detail = ", ".join(
+            f"{k}={v.probability:.2f}" for k, v in results.items()
+        )
+        failures = int(getattr(client, "failures", 0) or 0)
+        if failures:
+            last = getattr(client, "last_error", "") or ""
+            return False, f"主适配器失败，已退回本地词法：{last}（{ms:.0f}ms）"
+        return True, f"{detail or '（没有信号）'}（{ms:.0f}ms）"
+
+    def _patch_config_sys1(self, provider: str, model: str, base_url: str) -> str:
+        """把 sys1 的改动写回 xingli.toml（只动 [sys1] 段，别的不碰）。"""
+        path = Path(self.config_path) if self.config_path else None
+        if path is None or not path.is_file():
+            return "（没有配置文件，跳过持久化）"
+        values = {"provider": provider, "base_url": base_url, "model": model}
+        text = path.read_text(encoding="utf-8")
+        if not re.search(r"^\[sys1\]", text, re.MULTILINE):
+            block = "\n[sys1]\n" + "".join(
+                f'{key} = "{value}"\n' for key, value in values.items()
+            ) + "timeout_sec = 8\n"
+            path.write_text(text.rstrip() + "\n" + block, encoding="utf-8")
+            return f"已追加 [sys1] 到 {path}"
+        out: list[str] = []
+        written: set[str] = set()
+        inside = False
+        for line in text.splitlines():
+            if re.match(r"^\s*\[", line):
+                if inside:
+                    out.extend(
+                        f'{key} = "{value}"'
+                        for key, value in values.items()
+                        if key not in written
+                    )
+                inside = line.strip().lower().startswith("[sys1")
+                written.clear() if inside else None
+                out.append(line)
+                continue
+            if inside:
+                match = re.match(r"^\s*(provider|base_url|model)\s*=", line)
+                if match:
+                    key = match.group(1)
+                    if key in written:
+                        continue  # 重复键：丢掉旧的
+                    out.append(f'{key} = "{values[key]}"')
+                    written.add(key)
+                    continue
+            out.append(line)
+        if inside:
+            out.extend(
+                f'{key} = "{value}"'
+                for key, value in values.items()
+                if key not in written
+            )
+        path.write_text("\n".join(out) + "\n", encoding="utf-8")
+        return f"已写回 {path}"
+
+    async def _sys1_command(self, arg: str) -> None:
+        cfg = self.hb.config
+        parts = arg.split()
+        sub = (parts[0] if parts else "").lower()
+        if sub in {"", "status", "probe"}:
+            print(self._sys1_banner())
+            print(
+                f"  配置：provider={cfg.sys1.provider} · model={cfg.sys1.model or '(空)'} · "
+                f"base_url={cfg.sys1.base_url or '(空)'} · timeout={cfg.sys1.timeout_sec}s"
+            )
+            ok, detail = await self._call(self._probe_sys1)
+            print(f"  活体探测：{'✓' if ok else '✗'} {detail}")
+            if not ok and cfg.sys1.provider != "local":
+                print("  常见原因：模型名写错 / 端点只跑了一个模型（llama.cpp 一次一个）/ 超时太短")
+                print("  试用：/sys1 on Kev-4B-GGUF  或  /sys1 on Qwen3.5-2B-GGUF")
+            return
+        if sub in {"off", "local", "none"}:
+            self.hb.config = replace(
+                self.hb.config, sys1=replace(cfg.sys1, provider="local")
+            )
+            self.hb.reflex.config = self.hb.config
+            self.hb.reflex.client = build_sys1_client(self.hb.config)
+            print(f"System One 已切回本地词法：{getattr(self.hb.reflex.client, 'name', '?')}")
+            print(self._patch_config_sys1("local", cfg.sys1.model, cfg.sys1.base_url))
+            return
+        if sub in {"on", "llm", "llm_fallback", "jev"}:
+            model = " ".join(parts[1:]).strip() or cfg.sys1.model
+            base_url = (cfg.sys1.base_url or cfg.sys2.base_url).rstrip("/")
+            provider = "jev" if sub == "jev" else "llm_fallback"
+            new_sys1 = replace(
+                cfg.sys1,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                timeout_sec=min(cfg.sys1.timeout_sec, 15) or 8,
+            )
+            self.hb.config = replace(self.hb.config, sys1=new_sys1)
+            self.hb.reflex.config = self.hb.config
+            self.hb.reflex.client = build_sys1_client(self.hb.config)
+            print(f"System One：{getattr(self.hb.reflex.client, 'name', '?')}（{model or '默认模型'}）")
+            ok, detail = await self._call(self._probe_sys1)
+            print(f"  活体探测：{'✓' if ok else '✗'} {detail}")
+            if not ok:
+                print("  ⚠ 没接上：仍然会正常工作，但丘脑退回本地词法（不会卡住聊天）")
+            print(self._patch_config_sys1(provider, model, base_url))
+            return
+        print("用法：/sys1 [status] ｜ /sys1 on <模型名> ｜ /sys1 off")
 
     # ------------------------------------------------------------------
     def _banner_context(self) -> str:
@@ -252,7 +498,7 @@ class ChatCLI:
                 if cfg.sys2.provider != "mock" and cfg.sys2.base_url
                 else ""
             ),
-            f"System One：{getattr(hb.reflex.client, 'name', '?')}",
+            self._sys1_banner(),
             f"工作区：{self.ws.root}"
             + (f"  ·  配置：{self.config_path}" if self.config_path else "  ·  配置：默认值"),
             f"记忆文件：cortex/episodes {episodes} 个 · cortex/turns {turns} 个"
@@ -327,6 +573,10 @@ class ChatCLI:
                 for note in notes[-3:]:
                     print(f"  适配：{note}")
             print(f"System One：{getattr(self.hb.reflex.client, 'name', '?')}")
+            print(f"  配置：provider={cfg.sys1.provider} · model={cfg.sys1.model or '(空)'}")
+            last_frame_tick = self.hb.last_tick
+            if last_frame_tick is not None:
+                print(f"  上一拍丘脑耗时：{last_frame_tick.sys1_ms:.0f}ms")
             client = self.hb.reflex.client
             if getattr(client, "circuit_open", False):
                 print(f"  ⚠ 断路器打开：{client.last_error}")
@@ -386,6 +636,17 @@ class ChatCLI:
                 print("预填已关")
             else:
                 print("用法：/prefill on|off")
+        elif cmd == "/sys1":
+            await self._sys1_command(arg)
+        elif cmd == "/forget":
+            node = self.hb.store.get(arg) if arg else None
+            if node is None or not self.hb.store.is_visible(node, self.speaker):
+                print("（这条记忆在当前说话人面前不存在）")
+                return
+            if self.hb.store.archive(node.id):
+                print(f"已作废 #{node.id}「{node.lod0[:40]}」（文件与 Git 账本都还在，可 /rollback）")
+            else:
+                print(f"#{node.id} 早已作废")
         elif cmd == "/thought":
             self.show_thought = not self.show_thought
             print(f"内心 OS 打印：{'开' if self.show_thought else '关'}")
@@ -503,10 +764,13 @@ model = "{sys1_model}"
 timeout_sec = 15
 # 连续失败两次后自动退回本地词法，避免每一拍都白等超时
 # （断路器逻辑在 kernel/sys1_jev.py::ChainClient）
+# 没配好也没关系：聊天里 /sys1 on Kev-4B-GGUF 立即接管并写回这里；/sys1 看活体探测。
 
 [budget]
 frame_tokens = 6000
 max_chain_ticks = 4
+max_chain_seconds = 60         # 一轮里连环思考最多花多久（本地 4B 一拍可能 15~40s）
+min_wake_sec = 30              # 自主唤醒最短预约间隔，防止自激循环
 max_proactive_per_hour = 6
 
 # 若你的模型把预算全花在“思考”上、content 为空：
@@ -592,6 +856,11 @@ def _run_once(
     except Sys2Error as exc:
         print(f"⟨端点错误⟩ {exc}", file=sys.stderr)
         return 2
+    except Exception as exc:  # noqa: BLE001 - 只跑一句，也不该甩一整页 traceback
+        print(f"⟨这一拍出了异常⟩ {type(exc).__name__}: {exc}", file=sys.stderr)
+        if os.environ.get("XINGLI_TRACEBACK"):
+            traceback.print_exc()
+        return 1
     elapsed = time.monotonic() - started
     for tick in result.ticks:
         if show_thought and tick.packet and tick.packet.inner_monologue:
@@ -633,6 +902,8 @@ def _selftest(root: Path, cfg: Config) -> int:
     ws = Workspace.open(target, cfg)
     print("== 星璃自检 ==")
     print(f"工作区：{target}（每次重建）")
+    client = build_sys1_client(cfg)
+    print(f"System One：{getattr(client, 'name', '?')}（provider={cfg.sys1.provider}）")
     if cfg.sys2.provider == "mock":
         print("⚠ 当前是 mock 大脑；要测真实端点请先去掉 --mock 并配好 xingli.toml")
     if cfg.sys2.provider != "mock":
@@ -654,6 +925,11 @@ def _selftest(root: Path, cfg: Config) -> int:
         print(f"\n✗ 调用失败：{exc}")
         print("  排查：端点是否在线 / model 名称是否正确 / max_tokens 是否太小 / 上下文长度是否够")
         return 2
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n✗ 这一拍出了异常：{type(exc).__name__}: {exc}")
+        if os.environ.get("XINGLI_TRACEBACK"):
+            traceback.print_exc()
+        return 1
     elapsed = time.monotonic() - started
     modes = [t.mode or "空包" for t in result.ticks]
     print(f"\n✓ 端点返回，用时 {elapsed:.1f}s，{len(result.ticks)} 拍（{' / '.join(modes)}）")

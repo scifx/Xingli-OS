@@ -636,6 +636,9 @@ class MockSys2Client:
         packet = self._think(user)
         if self.force_continue:
             packet.wake.continue_think = {"reason": "测试：强制连锁思考"}
+            if packet.say:
+                # 每拍换一句话，模拟“真的在想下一层”，而不是复读
+                packet.say = f"{packet.say}（第 {self.calls} 拍）"
         return dumps(packet.to_dict())
 
     # ------------------------------------------------------------------

@@ -449,6 +449,17 @@ class ThoughtPacket:
         code_action, note = _pick(d, "code_action")
         if note:
             warnings.append(note)
+        if isinstance(code_action, Mapping):
+            # 有的模型写成 {"language": "python", "code": "..."}，接住它
+            for key in ("code", "source", "script", "python", "body"):
+                value = code_action.get(key)
+                if isinstance(value, str) and value.strip():
+                    code_action = value
+                    warnings.append("code_action 是对象，已取出其中的代码")
+                    break
+            else:
+                warnings.append("code_action 对象里没有代码，已忽略")
+                code_action = None
         if code_action is not None and not isinstance(code_action, str):
             warnings.append("code_action 非字符串，已忽略")
             code_action = None
@@ -547,6 +558,8 @@ class AppliedActions:
     emotion: dict[str, float] = field(default_factory=dict)
     scheduled: list[dict[str, Any]] = field(default_factory=list)
     code_output: str = ""
+    #: 内核自己做的事（去重、称呼更正、作废旧记忆）——不是错误，分开显示
+    notes: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -561,6 +574,7 @@ class AppliedActions:
             "emotion": dict(self.emotion),
             "scheduled": list(self.scheduled),
             "code_output": self.code_output,
+            "notes": list(self.notes),
             "errors": list(self.errors),
         }
 
@@ -576,6 +590,8 @@ class TickReport:
     signals: list[ReflexSignal] = field(default_factory=list)
     actions: AppliedActions = field(default_factory=AppliedActions)
     duration_ms: float = 0.0
+    #: 丘脑（Sys1）在这一拍花掉的时间，用来判断该不该给本地模型接丘脑
+    sys1_ms: float = 0.0
     env: dict[str, Any] = field(default_factory=dict)
     #: 输出形态：json（契约）/ prose（降级纯发言）/ code / empty
     mode: str = ""

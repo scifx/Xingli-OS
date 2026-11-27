@@ -192,7 +192,7 @@ def test_proactive_hourly_budget(ws, clock):
     payload = {
         "inner_monologue": "预约",
         "say": "好",
-        "wake": {"schedule_wake": {"after_sec": 10, "reason": "测试"}},
+        "wake": {"schedule_wake": {"after_sec": 40, "reason": "测试"}},
     }
     hb = Heartbeat.create(ws, cfg, sys2=JsonBrain(payload), now_fn=clock)
     hb.handle_message("owner", "一")
@@ -201,11 +201,11 @@ def test_proactive_hourly_budget(ws, clock):
     assert len(hb.scheduler.pending()) == 2, "队列长度受配额约束"
     assert any("队列已满" in e for e in third.ticks[0].actions.errors)
 
-    clock.advance(11)
+    clock.advance(41)
     fired = hb.poll_wakes()
     assert len(fired) == 2
     # 本小时配额用尽后不再主动开口
-    clock.advance(11)
+    clock.advance(41)
     assert hb.poll_wakes() == []
 
 
@@ -237,7 +237,9 @@ def test_any_json_packet_applies_all_fields(ws, clock):
     assert result.says == ["谢谢你愿意讲这些。"]
     assert hb.relations.get("owner")["custom"]["note"] == "今天很坦诚"
     assert result.ticks[0].actions.focus_changed
-    assert result.ticks[0].actions.memorized
+    # 同一件事实第二次出现会被去重（不新建文件），所以“记了”与“去重了”都算记住
+    tick = result.ticks[0]
+    assert tick.actions.memorized or any("去重" in note for note in tick.actions.notes)
     assert hb.emotion.load().values["warmth"] > 0.6
 
 

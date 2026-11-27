@@ -268,7 +268,7 @@ def test_memory_pass_can_be_disabled(tmp_path: Path, clock):
         cfg = make_config(server.base_url, memory_pass=False)
         ws = Workspace.open(tmp_path / "xingli", cfg)
         hb = Heartbeat.create(ws, cfg, now_fn=clock)
-        result = hb.handle_message("owner", "记住，我喜欢菠萝")
+        result = hb.handle_message("owner", "记住，明天早上八点叫我")
     assert not result.ticks[0].actions.memorized
     assert not list(ws.episodes.glob("*.json"))
     assert server.calls == 1

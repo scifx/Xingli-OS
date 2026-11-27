@@ -17,11 +17,13 @@ from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, Callable, Sequence
 
+from kernel.claims import Claim, extract_claims, is_correction
 from kernel.config import Config
 from kernel.evolution import Evolver
 from kernel.git_ledger import GitLedger
 from kernel.models import (
     AppliedActions,
+    FocusUpdate,
     Event,
     HeartbeatResult,
     ThoughtPacket,
@@ -35,7 +37,7 @@ from kernel.sandbox import Sandbox
 from kernel.scheduler import ProactiveBudgetExceeded, Scheduler
 from kernel.sys1_jev import ReflexEngine, build_client
 from kernel.sys2_llm import Sys2Client, Sys2Error, build_sys2
-from kernel.textutil import extractive_summary, one_line
+from kernel.textutil import extractive_summary, one_line, similarity
 from memory.emotion import EmotionStore
 from memory.focal_context import FocalContext
 from memory.frame_compiler import Frame, FrameCompiler
@@ -73,6 +75,7 @@ class Heartbeat:
     now_fn: Callable[[], datetime] = now_utc
     last_frame: Frame | None = None
     last_packet: ThoughtPacket | None = None
+    last_tick: TickReport | None = None
     on_event: Callable[[str], None] | None = None
 
     # ------------------------------------------------------------------
@@ -133,20 +136,43 @@ class Heartbeat:
     # ------------------------------------------------------------------
     # 对外入口
     # ------------------------------------------------------------------
-    def handle_message(self, speaker_id: str, text: str) -> HeartbeatResult:
+    def handle_message(
+        self, speaker_id: str, text: str, should_stop: Callable[[], bool] | None = None
+    ) -> HeartbeatResult:
         return self.handle_event(
-            Event(kind="message", speaker_id=speaker_id or "owner", text=text or "")
+            Event(kind="message", speaker_id=speaker_id or "owner", text=text or ""),
+            should_stop=should_stop,
         )
 
-    def handle_event(self, event: Event) -> HeartbeatResult:
+    def handle_event(
+        self, event: Event, should_stop: Callable[[], bool] | None = None
+    ) -> HeartbeatResult:
+        """处理一次外部事件；``should_stop`` 让调用方（比如 CLI）随时收尾。
+
+        连环思考有三个刹车：重复输出、单轮时间预算、以及调用方的“有人插话了”。
+        没有新信息就不再自转——自转是手段，不是目的。
+        """
         result = HeartbeatResult(event=event)
         carried: list[dict[str, str]] = []
         says: list[str] = []
         monologues: list[str] = []
+        said_fingerprints: list[str] = []
         tick = 1
         halted = ""
+        started = time.monotonic()
+        budget_cfg = getattr(self.config.budget, "max_chain_seconds", 60)
+        budget_sec = None if budget_cfg is None else float(budget_cfg)
         while True:
             report = self._tick(event, tick, carried)
+            # 同一轮里重复的话只留一次：自言自语不该变成刷屏
+            fresh: list[str] = []
+            for say in report.actions.says:
+                if any(similarity(say, prev) >= 0.9 for prev in said_fingerprints):
+                    continue
+                said_fingerprints.append(say)
+                fresh.append(say)
+            repeated = len(report.actions.says) - len(fresh)
+            report.actions.says = fresh
             result.ticks.append(report)
             packet = report.packet
             if packet is None:
@@ -154,15 +180,33 @@ class Heartbeat:
                 break
             if packet.inner_monologue:
                 monologues.append(packet.inner_monologue)
-            if report.actions.says:
-                says.extend(report.actions.says)
-            next_carried = self._carried_from(report.actions)
+            says.extend(fresh)
+            actions = report.actions
+            progress = bool(
+                fresh
+                or actions.recalls
+                or actions.memorized
+                or actions.relation_updates
+                or actions.focus_changed
+                or actions.scheduled
+                or actions.notes
+            )
+            next_carried = self._carried_from(actions)
             wants_continue = packet.wake.continue_think is not None
-            auto_continue = bool(next_carried) and not report.actions.says and not wants_continue
-            if not (wants_continue or auto_continue):
+            if repeated and not fresh:
+                halted = "模型在重复上一拍的话，内核停止自转"
+                break
+            if should_stop is not None and should_stop():
+                halted = "主人插话了，这一轮先收尾"
+                break
+            auto_continue = bool(next_carried) and not fresh and not wants_continue
+            if not progress or not (wants_continue or auto_continue):
                 break
             if tick >= self.max_chain_ticks:
                 halted = f"达到 MAX_CHAIN_TICKS={self.max_chain_ticks} 硬熔断"
+                break
+            if budget_sec is not None and (time.monotonic() - started) >= budget_sec:
+                halted = f"单轮思考超过 {budget_sec:.0f}s 预算，先收尾（可改 [budget] max_chain_seconds）"
                 break
             if auto_continue:
                 self._emit(
@@ -176,7 +220,11 @@ class Heartbeat:
         result.halted_reason = halted
         return result
 
-    def poll_wakes(self, now: datetime | None = None) -> list[HeartbeatResult]:
+    def poll_wakes(
+        self,
+        now: datetime | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> list[HeartbeatResult]:
         """触发所有到期的自主唤醒（受每小时配额限制）。"""
         now = now or self.now_fn()
         results: list[HeartbeatResult] = []
@@ -192,7 +240,7 @@ class Heartbeat:
                 text="",
                 extra={"reason": ticket.reason, "ticket": ticket.id},
             )
-            results.append(self.handle_event(event))
+            results.append(self.handle_event(event, should_stop=should_stop))
         self.scheduler.prune()
         return results
 
@@ -211,7 +259,9 @@ class Heartbeat:
 
         # 2) Sys1：一次并行扇出 + 三段门控
         state_text = self._sys1_state(event, now)
+        scan_started = time.monotonic()
         scan = self.reflex.scan(state_text, event.speaker_id, now)
+        sys1_ms = (time.monotonic() - scan_started) * 1000
         if scan.emotion:
             state.apply(scan.emotion)
         self.emotion.save(state)
@@ -231,6 +281,7 @@ class Heartbeat:
             section_tokens=frame.section_tokens,
             signals=list(scan.signals),
             env=frame.env,
+            sys1_ms=sys1_ms,
         )
         try:
             raw = self.sys2.complete(frame.system, frame.user)
@@ -246,11 +297,20 @@ class Heartbeat:
         parse_errors = list(packet.parse_warnings) if mode in {"empty", "prose"} else []
 
         # 5) 应用（声明式字段 + 可选代码载荷）
-        report.actions = self._apply(packet, event, scan)
+        #    单个畸形认知包不该让整轮聊天崩掉：出错就只丢这一拍的动作。
+        try:
+            report.actions = self._apply(packet, event, scan)
+        except Exception as exc:  # noqa: BLE001
+            report.actions = AppliedActions()
+            report.actions.errors.append(
+                f"应用认知包失败（已跳过本拍动作）: {type(exc).__name__}: {exc}"
+            )
         report.actions.errors.extend(parse_errors)
         if tick == 1:
             self._memory_pass(event, packet, report.actions)
+            self._apply_claims(event, report.actions)
         report.duration_ms = (time.monotonic() - start) * 1000
+        self.last_tick = report
         return report
 
     def _memory_pass(self, event: Event, packet: ThoughtPacket, actions: AppliedActions) -> None:
@@ -308,6 +368,7 @@ class Heartbeat:
     def _apply(self, packet: ThoughtPacket, event: Event, scan) -> AppliedActions:
         actions = AppliedActions()
         builder = PacketBuilder(event.speaker_id, store=self.store, relations=self.relations)
+        self._normalize_ops(packet, actions)
 
         if packet.code_action:
             outcome = apply_code_action(packet.code_action, builder)
@@ -334,7 +395,7 @@ class Heartbeat:
                 packet.inner_monologue = (
                     packet.inner_monologue + "\n" + extra.inner_monologue
                 ).strip()
-            actions.code_output = extra.notes and "; ".join(extra.notes) or ""
+            actions.code_output = "; ".join(builder.notes)
 
         # ---- 注意力调焦 ------------------------------------------------
         if packet.focus_update:
@@ -355,7 +416,9 @@ class Heartbeat:
         for op in packet.memory_ops:
             kind = str(op.get("op", "")).lower()
             try:
-                if kind == "recall":
+                if kind in {"archive", "forget", "retract", "supersede"}:
+                    self._op_archive(op, event, actions)
+                elif kind == "recall":
                     self._op_recall(op, event, actions)
                 elif kind == "recall_turn":
                     self._op_recall_turn(op, event, actions)
@@ -394,8 +457,19 @@ class Heartbeat:
         spec = packet.wake.schedule_wake
         if spec:
             try:
+                after_sec = spec.get("after_sec", 60)
+                try:
+                    after_sec = float(after_sec)
+                except (TypeError, ValueError):
+                    after_sec = 60.0
+                floor = float(getattr(self.config.budget, "min_wake_sec", 30) or 0)
+                if after_sec < floor:
+                    actions.notes.append(
+                        f"预约唤醒间隔 {after_sec:.0f}s 太短，按最短 {floor:.0f}s 排"
+                    )
+                    after_sec = floor
                 ticket = self.scheduler.schedule(
-                    spec.get("after_sec", 60),
+                    after_sec,
                     reason=str(spec.get("reason", "")),
                     target_speaker=spec.get("target_speaker"),
                     now=self.now_fn(),
@@ -407,6 +481,64 @@ class Heartbeat:
                 actions.errors.append(f"预约唤醒失败: {exc}")
 
         return actions
+
+    # ------------------------------------------------------------------
+    # 认知包里的“放错抽屉”的字段
+    # ------------------------------------------------------------------
+    def _normalize_ops(self, packet: ThoughtPacket, actions: AppliedActions) -> None:
+        """把模型塞错位置的动作挪回它该在的抽屉。
+
+        实测里最常见的三种：``focus_update`` 写进 ``memory_ops``、
+        ``emotion_delta`` / ``update_affinity`` 写进 ``evolve_ops``。
+        它们不是“不认识的进化操作”，只是放错了地方——静默归位，并留一条痕迹。
+        """
+        moved: list[str] = []
+        for op in list(packet.memory_ops):
+            kind = str(op.get("op") or op.get("kind") or "").lower()
+            if kind in {"focus", "focus_update", "attention"}:
+                packet.memory_ops.remove(op)
+                packet.focus_update = packet.focus_update or FocusUpdate.from_dict(
+                    {k: v for k, v in op.items() if k not in {"op", "kind"}}
+                )
+                moved.append("focus_update")
+            elif kind in {"emotion", "emotion_delta", "feel"}:
+                packet.memory_ops.remove(op)
+                for key, value in op.items():
+                    if key not in {"op", "kind"}:
+                        packet.emotion_delta.setdefault(key, value)
+                moved.append("emotion_delta")
+            elif kind in {"relation", "update_affinity", "relation_update"}:
+                packet.memory_ops.remove(op)
+                packet.relation_ops.append(
+                    {k: v for k, v in op.items() if k not in {"op", "kind"}}
+                )
+                moved.append("relation_op")
+
+        kept: list[dict[str, Any]] = []
+        for op in packet.evolve_ops:
+            kind = str(op.get("op") or op.get("kind") or "").lower()
+            body = {k: v for k, v in op.items() if k not in {"op", "kind"}}
+            if kind in {"focus", "focus_update", "attention"}:
+                packet.focus_update = packet.focus_update or FocusUpdate.from_dict(body)
+                moved.append("focus_update")
+            elif kind in {"emotion", "emotion_delta", "feel"}:
+                for key, value in body.items():
+                    packet.emotion_delta.setdefault(key, value)
+                moved.append("emotion_delta")
+            elif kind in {"memorize", "remember", "memory", "memory_op"}:
+                packet.memory_ops.append({"op": "memorize", **body})
+                moved.append("memorize")
+            elif kind in {"relation", "update_affinity", "affinity", "relation_update"}:
+                packet.relation_ops.append(body)
+                moved.append("relation_op")
+            else:
+                kept.append(op)
+        if len(kept) != len(packet.evolve_ops):
+            packet.evolve_ops = kept
+        if moved:
+            actions.notes.append(
+                "字段归位：" + "、".join(sorted(set(moved))) + "（模型放错了抽屉，内核已接住）"
+            )
 
     # ------------------------------------------------------------------
     def _op_recall(self, op: dict[str, Any], event: Event, actions: AppliedActions) -> None:
@@ -473,6 +605,43 @@ class Heartbeat:
             }
         )
 
+    def _op_archive(self, op: dict[str, Any], event: Event, actions: AppliedActions) -> None:
+        """作废一条记忆（``forget``）：只标记归档，文件与账本都留着。"""
+        mem_id = str(op.get("mem_id") or op.get("id") or "")
+        node = self.store.get(mem_id) if mem_id else None
+        if node is None or not MemoryStore.is_visible(node, event.speaker_id):
+            actions.errors.append(f"forget：记忆 {mem_id or '(空)'} 不存在")
+            return
+        if node.source_id != event.speaker_id and event.speaker_id != "owner":
+            actions.errors.append("forget：只有记忆的来源者本人或主人可以作废它")
+            return
+        if self.store.archive(node.id):
+            actions.notes.append(f"作废记忆 #{node.id}「{one_line(node.lod0, 28)}」")
+        elif node.archived:
+            actions.notes.append(f"记忆 #{node.id} 早已作废")
+
+    @staticmethod
+    def _mem_key(text: str) -> str:
+        """去重用的骨架：去掉标点与“吃得了的着了”这类不改变事实的字。"""
+        return re.sub(r"[\s，。、：；！？,.:;!?（）()\[\]【】…—\-~\"'“”‘’吃得了的着了]", "", text).lower()
+
+    def _near_duplicate(self, event: Event, lod0: str, about: Sequence[str]):
+        """找一条“几乎一样”的旧记忆：同一件事不该每次都长出一个新文件。"""
+        try:
+            recent = self.store.list_nodes(event.speaker_id, limit=150)
+        except Exception:  # noqa: BLE001 - 去重是增强，不是必需
+            return None
+        for node in recent:
+            if node.lod0 == lod0:
+                return node
+            if about and not (set(node.about_ids) & set(about)):
+                continue
+            if similarity(node.lod0, lod0) >= 0.85:
+                return node
+            if similarity(self._mem_key(node.lod0), self._mem_key(lod0)) >= 0.85:
+                return node
+        return None
+
     def _op_memorize(
         self, op: dict[str, Any], event: Event, scan, actions: AppliedActions
     ) -> None:
@@ -506,6 +675,17 @@ class Heartbeat:
         except (TypeError, ValueError):
             importance = 0.6
 
+        duplicate = self._near_duplicate(event, lod0, about)
+        if duplicate is not None:
+            self.store.touch(duplicate.id)
+            self.store.set_importance(
+                duplicate.id, min(0.95, duplicate.importance + 0.05)
+            )
+            actions.notes.append(
+                f"记忆去重：已经记过「{one_line(lod0, 24)}」（#{duplicate.id}），没有重复新建"
+            )
+            return
+
         node = self.store.put(
             lod0=lod0,
             lod1=str(op.get("lod1") or lod0),
@@ -538,6 +718,119 @@ class Heartbeat:
             return
         self.relations.update(person, changes)
         actions.relation_updates.append(person)
+
+    # ------------------------------------------------------------------
+    # 显式事实校正：她必须能改口，也必须分得清“谁叫什么”
+    # ------------------------------------------------------------------
+    def _apply_claims(self, event: Event, actions: AppliedActions) -> None:
+        """从主人原话里读事实（称呼 / 偏好 / 生日），并让它**覆盖**旧记忆。
+
+        模型把“我的名字是 lucky”读成“主人叫星璃”是常态，所以她需要一条不依赖模型的
+        校正路径：改关系档案里的称呼、作废互相矛盾的旧称呼记忆、写一条钉选事实。
+        """
+        if event.kind != "message" or not (event.text or "").strip():
+            return
+        claims = extract_claims(event.text)
+        if not claims:
+            return
+        persona_name = str(self.compiler.persona().get("NAME") or "星璃")
+        correction = is_correction(event.text)
+        for claim in claims:
+            if claim.kind == "name":
+                self._claim_name(event, claim, correction, actions)
+            elif claim.kind == "self_name":
+                if claim.value and claim.value != persona_name:
+                    actions.notes.append(
+                        f"主人把她叫成「{claim.value}」，但她记得自己叫「{persona_name}」"
+                        "（改名属于人格进化，不擅自采纳）"
+                    )
+            elif claim.kind in {"like", "dislike", "allergy", "birthday"}:
+                self._claim_fact(event, claim, actions)
+
+    def _claim_name(
+        self, event: Event, claim: Claim, correction: bool, actions: AppliedActions
+    ) -> None:
+        speaker = event.speaker_id
+        value = claim.value
+        profile = self.relations.get(speaker)
+        old = str(profile.get("display_name") or speaker)
+        if old == value:
+            return
+        if not correction and old not in {"主人", speaker} and similarity(old, value) < 0.4:
+            # 不是纠错语气、但称呼确实变了：也照改，只是留下更明确的痕迹
+            pass
+        self.relations.update(speaker, {"display_name": value})
+        if speaker not in actions.relation_updates:
+            actions.relation_updates.append(speaker)
+        actions.notes.append(f"称呼更正：{old} → {value}（这是对方的名字）")
+        removed = self._retract_name_memories(speaker, value, actions)
+        if removed:
+            actions.notes.append(f"作废 {removed} 条旧称呼记忆，防止她再叫错")
+        node = self.store.put(
+            lod0=f"称呼：{value}（{speaker} 亲口说的自己的名字）",
+            lod1=f"{speaker} 的名字是 {value}；她的名字是 "
+            f"{self.compiler.persona().get('NAME') or '星璃'}，两者不能混。",
+            lod2=claim.raw or f"{speaker} 说：我叫 {value}",
+            kind="fact",
+            source_id=speaker,
+            about_ids=[speaker],
+            epistemic="direct",
+            visibility=[speaker],
+            importance=0.9,
+            pinned=True,
+            tags=["称呼"],
+        )
+        actions.memorized.append(node.id)
+
+    def _claim_fact(self, event: Event, claim: Claim, actions: AppliedActions) -> None:
+        speaker = event.speaker_id
+        templates = {
+            "like": ("主人喜欢{value}", 0.7, ["偏好"]),
+            "dislike": ("主人不喜欢{value}", 0.7, ["偏好"]),
+            "allergy": ("主人对{value}过敏", 0.9, ["禁忌"]),
+            "birthday": ("主人生日是{value}", 0.85, ["生日"]),
+        }
+        template, importance, tags = templates[claim.kind]
+        lod0 = template.format(value=claim.value)
+        duplicate = self._near_duplicate(event, lod0, [speaker])
+        if duplicate is not None:
+            self.store.touch(duplicate.id)
+            return
+        node = self.store.put(
+            lod0=lod0,
+            lod1=f"{lod0}（{speaker} 在 {event.text[:40]} 里说过）",
+            lod2=event.text or lod0,
+            kind="fact",
+            source_id=speaker,
+            about_ids=[speaker],
+            epistemic="direct",
+            visibility=[speaker],
+            importance=importance,
+            tags=tags,
+        )
+        actions.memorized.append(node.id)
+        actions.notes.append(f"事实入账：{lod0}")
+
+    def _retract_name_memories(
+        self, speaker: str, keep: str, actions: AppliedActions
+    ) -> int:
+        hints = ("名字", "称呼", "自称", "叫作", "叫我", "唤我")
+        removed = 0
+        try:
+            nodes = self.store.list_nodes(speaker, limit=500)
+        except Exception:  # noqa: BLE001
+            return 0
+        for node in nodes:
+            text = node.lod0
+            if keep and keep in text:
+                continue
+            if not any(hint in text for hint in hints):
+                continue
+            if speaker not in (node.about_ids or [speaker]):
+                continue
+            if self.store.archive(node.id):
+                removed += 1
+        return removed
 
     # ------------------------------------------------------------------
     def _carried_from(self, actions: AppliedActions) -> list[dict[str, str]]:

@@ -114,3 +114,72 @@ def test_mock_mode_still_works_without_config(tmp_path: Path, monkeypatch, capsy
     out = capsys.readouterr().out
     assert code == 0
     assert "星璃:" in out
+
+
+# ---------------------------------------------------------------------------
+# 丘脑（System One）切换：本地决策模型接不上时，可见、可切、可持久化
+# ---------------------------------------------------------------------------
+def test_sys1_command_probes_and_persists(tmp_path: Path, monkeypatch, capsys):
+    root = tmp_path / "ws"
+    cli.write_config(root, "http://127.0.0.1:9/v1", "fake-local")
+
+    class _FakeClient:
+        name = "llm_fallback->local_lexicon"
+        failures = 0
+        last_error = None
+
+        def fan_out(self, state, specs):
+            from kernel.sys1_jev import DecisionResult
+
+            return {
+                s.id: DecisionResult(spec_id=s.id, kind=s.kind, value=1.0, confidence=0.8)
+                for s in specs
+            }
+
+    monkeypatch.setattr(cli, "build_sys1_client", lambda cfg: _FakeClient())
+    monkeypatch.delenv("XINGLI_CONFIG", raising=False)
+    code = cli.main(["--root", str(root), "--mock", "--say", "你好"])
+    assert code == 0
+    capsys.readouterr()
+
+    # 直接用 CLI 对象测指令（不启动交互循环）
+    cfg = Config.load(root=root)
+    from kernel.paths import Workspace
+
+    ws = Workspace.open(root, cfg)
+    from kernel.boot import Heartbeat
+    from kernel.sys2_llm import MockSys2Client
+
+    hb = Heartbeat.create(ws, cfg, sys2=MockSys2Client(), sys1_client=_FakeClient())
+    chat = cli.ChatCLI(hb, ws, config_path=str(root / "xingli.toml"))
+    import asyncio
+
+    asyncio.run(chat._sys1_command("on Kev-4B-GGUF"))
+    out = capsys.readouterr().out
+    assert "活体探测：✓" in out
+    assert "已写回" in out
+    text = (root / "xingli.toml").read_text(encoding="utf-8")
+    assert 'provider = "llm_fallback"' in text
+    assert 'model = "Kev-4B-GGUF"' in text
+    assert hb.config.sys1.provider == "llm_fallback"
+
+
+def test_read_line_drains_queue_in_order(tmp_path: Path, monkeypatch, capsys):
+    from kernel.boot import Heartbeat
+    from kernel.paths import Workspace
+    from kernel.sys2_llm import MockSys2Client
+
+    cfg = Config()
+    ws = Workspace.open(tmp_path / "ws", cfg)
+    hb = Heartbeat.create(ws, cfg, sys2=MockSys2Client())
+    chat = cli.ChatCLI(hb, ws)
+    chat.queue.extend(["第一句", "/status", "第二句"])
+    import asyncio
+
+    async def drain():
+        return [await chat._read_line() for _ in range(3)]
+
+    assert asyncio.run(drain()) == ["第一句", "/status", "第二句"]
+    assert chat._interrupt() is False
+    chat.queue.append("插话")
+    assert chat._interrupt() is True

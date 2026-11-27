@@ -171,7 +171,11 @@ class FrameCompiler:
             "social": self.social.capture(speaker),
             "world": self.world.capture(),
         }
-        env_text = self._render_env(env_snapshot, user_budget)
+        env_text = self._render_env(
+            env_snapshot,
+            user_budget,
+            persona_name=str(self.persona().get("NAME") or "星璃"),
+        )
         sys1_text = self._render_sys1(signals)
         event_text = self._render_event(event, carried)
 
@@ -253,12 +257,22 @@ class FrameCompiler:
         )
 
     # ------------------------------------------------------------------
-    def _render_env(self, snapshot: Mapping[str, Any], budget: int) -> str:
+    def _render_env(
+        self, snapshot: Mapping[str, Any], budget: int, persona_name: str = ""
+    ) -> str:
+        social = snapshot["social"]
         lines = [
             self.clock.render(snapshot["clock"]),
-            self.social.render(snapshot["social"]),
+            self.social.render(social),
             self.world.render(snapshot["world"]),
         ]
+        display = str(social.get("display_name") or social.get("speaker_id") or "")
+        if persona_name and display and display != persona_name:
+            # 小模型最容易犯的错：把“我是谁”和“对方是谁”搞混
+            lines.append(
+                f"称呼：对方叫「{display}」；你叫「{persona_name}」。"
+                "两个名字分清楚，别把对方叫成你的名字。"
+            )
         text = "\n".join(lines)
         return truncate(text, max(200, budget * 2))
 
