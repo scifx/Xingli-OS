@@ -75,6 +75,13 @@ class Sys2Config:
     contract: str = "full"
     #: 在认知帧末尾再贴一次“只要 JSON”的短提醒（有些模型的 chat template 会吞掉 system）
     contract_in_user: bool = False
+    #: 预填 assistant 开头，逼模型“接着 JSON 往下写”。off | say
+    #:   say: 预填 {"inner_monologue": "", "say": "  —— 让它先说话，思考模型也没法长篇叙事
+    prefill: str = "off"
+    #: 检测到“模型在叙述分析过程”时，自动用预填再试一次（只多一趟短请求）
+    auto_prefill: bool = True
+    #: 弱模型补洞：模型没写 memory_ops 时，内核再发一次极短的“记忆抽取”请求
+    memory_pass: bool = True
 
     @property
     def resolved_api_key(self) -> str:
@@ -102,6 +109,9 @@ class Sys2Config:
             extra_body=_as_mapping(d.get("extra_body")),
             contract=_as_str(d.get("contract"), cls.contract),
             contract_in_user=_as_bool(d.get("contract_in_user"), cls.contract_in_user),
+            prefill=_as_str(d.get("prefill"), cls.prefill).lower(),
+            auto_prefill=_as_bool(d.get("auto_prefill"), cls.auto_prefill),
+            memory_pass=_as_bool(d.get("memory_pass"), cls.memory_pass),
         )
 
 

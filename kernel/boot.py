@@ -10,9 +10,11 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Callable, Sequence
 
 from kernel.config import Config
@@ -43,6 +45,13 @@ from memory.store import MemoryStore
 from sensors.clock import ClockSensor
 from sensors.social import SocialSensor
 from sensors.world import WorldSensor
+
+
+#: 值得长期记住的“话头”（弱模型自己不会写 memory_ops，内核据此决定要不要补抽）
+MEMORY_CUES = re.compile(
+    "记住|记下|别忘|不要忘|喜欢|讨厌|最爱|生日|答应|承诺|以后|我叫|我的名字|"
+    "偏好|过敏|习惯|提醒|私密|别告诉|只告诉|约定"
+)
 
 
 @dataclass
@@ -239,8 +248,41 @@ class Heartbeat:
         # 5) 应用（声明式字段 + 可选代码载荷）
         report.actions = self._apply(packet, event, scan)
         report.actions.errors.extend(parse_errors)
+        if tick == 1:
+            self._memory_pass(event, packet, report.actions)
         report.duration_ms = (time.monotonic() - start) * 1000
         return report
+
+    def _memory_pass(self, event: Event, packet: ThoughtPacket, actions: AppliedActions) -> None:
+        """弱模型补洞：模型没写记忆动作时，用一次极短请求抽取值得记住的事。
+
+        这是显式的降级路径：抽取结果同样走 `_op_memorize`，隐私/信源铁律一条不少。
+        """
+        if not getattr(self.config.sys2, "memory_pass", True):
+            return
+        if event.kind != "message" or packet.memory_ops:
+            return
+        if not MEMORY_CUES.search(event.text or ""):
+            return
+        extractor = getattr(self.sys2, "extract_memory_ops", None)
+        if extractor is None:
+            return
+        try:
+            ops = extractor(event.text, "\n".join(actions.says))
+        except Exception as exc:  # noqa: BLE001 - 回填失败绝不毁掉这一拍
+            actions.errors.append(f"记忆回填失败：{type(exc).__name__}: {exc}")
+            return
+        if not ops:
+            return
+        shim = SimpleNamespace(importance=lambda default=0.6: default)
+        before = len(actions.memorized)
+        for op in ops[:3]:
+            self._op_memorize(op, event, shim, actions)
+        added = len(actions.memorized) - before
+        if added:
+            actions.errors.append(
+                f"记忆回填：模型没写 memory_ops，内核补抽了 {added} 条（弱模型降级路径）"
+            )
 
     def _sys1_state(self, event: Event, now: datetime) -> str:
         clock = self.compiler.clock.capture(event.speaker_id, now=now)

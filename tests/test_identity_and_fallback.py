@@ -139,3 +139,136 @@ def test_contract_reminder_can_ride_in_the_frame(tmp_path: Path, clock):
         hb = Heartbeat.create(ws, cfg, now_fn=clock)
         hb.handle_message("owner", "你好")
         assert "[OUTPUT_FORMAT]" not in hb.last_frame.user
+
+
+# ---------------------------------------------------------------------------
+# 思考型模型：预填 JSON 开头，逼它直接说人话
+# ---------------------------------------------------------------------------
+REASONING_TEXT = "首先，用户要求只输出合法JSON，字段有 inner_monologue, say。首先分析当前场景……"
+
+
+def test_reasoning_output_triggers_one_auto_prefill_retry():
+    state = {"n": 0}
+
+    def handler(payload, headers):
+        state["n"] += 1
+        last = payload["messages"][-1]
+        if last["role"] == "assistant":
+            # 模型在 prefill 之后只负责把话说下去
+            return chat_reply('我是星璃。我会记住你的牙医预约。"}')
+        return chat_reply(REASONING_TEXT)
+
+    with FakeOpenAI(handler) as server:
+        cfg = make_config(server.base_url, auto_prefill=True)
+        client = OpenAICompatibleClient(cfg)
+        text = client.complete("S", "U")
+        assert json.loads(text)["say"] == "我是星璃。我会记住你的牙医预约。"
+        assert state["n"] == 2
+        assert server.requests[1]["messages"][-1]["role"] == "assistant"
+        assert server.requests[1]["messages"][-1]["content"].startswith('{"inner_monologue"')
+        assert any("预填" in note for note in client.notes)
+
+
+def test_auto_prefill_can_be_disabled():
+    with FakeOpenAI(lambda p, h: chat_reply(REASONING_TEXT)) as server:
+        client = OpenAICompatibleClient(make_config(server.base_url, auto_prefill=False))
+        assert "首先" in client.complete("S", "U")
+        assert server.calls == 1
+
+
+def test_prefill_truncated_output_salvages_the_sentence():
+    with FakeOpenAI(lambda p, h: chat_reply("我是星璃，我记得你下周三要看牙医")) as server:
+        client = OpenAICompatibleClient(make_config(server.base_url, prefill="say"))
+        assert client.complete("S", "U") == "我是星璃，我记得你下周三要看牙医"
+        assert server.requests[0]["messages"][-1]["role"] == "assistant"
+        assert any("抢救" in note for note in client.notes)
+
+
+def test_prefill_packet_reaches_the_chat(tmp_path: Path, clock):
+    def handler(payload, headers):
+        if payload["messages"][-1]["role"] == "assistant":
+            return chat_reply('是的，我记得。"}')
+        return chat_reply(REASONING_TEXT)
+
+    with FakeOpenAI(handler) as server:
+        cfg = make_config(server.base_url)
+        ws = Workspace.open(tmp_path / "xingli", cfg)
+        hb = Heartbeat.create(ws, cfg, now_fn=clock)
+        result = hb.handle_message("owner", "你还记得我喜欢吃什么吗")
+    assert result.says == ["是的，我记得。"]
+    assert result.ticks[0].mode == "json"
+
+
+# ---------------------------------------------------------------------------
+# 弱模型补洞：模型不写 memory_ops 时，内核补抽一次
+# ---------------------------------------------------------------------------
+EXTRACT_SYSTEM_HINT = "记忆抽取器"
+
+
+def _extract_reply() -> str:
+    return json.dumps(
+        {
+            "memory_ops": [
+                {
+                    "op": "memorize",
+                    "lod0": "主人喜欢吃菠萝和芒果",
+                    "lod1": "主人明确说过喜欢菠萝和芒果。",
+                    "lod2": "主人：你记住，我喜欢吃菠萝和芒果。",
+                    "importance": 0.75,
+                    "tags": ["偏好"],
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_memory_pass_fills_in_for_weak_models(tmp_path: Path, clock):
+    def handler(payload, headers):
+        messages = payload["messages"]
+        if EXTRACT_SYSTEM_HINT in messages[0]["content"]:
+            return chat_reply(_extract_reply())
+        if messages[-1]["role"] == "assistant":
+            return chat_reply('好，菠萝和芒果我记住了。"}')
+        return chat_reply(REASONING_TEXT)
+
+    with FakeOpenAI(handler) as server:
+        cfg = make_config(server.base_url)
+        ws = Workspace.open(tmp_path / "xingli", cfg)
+        hb = Heartbeat.create(ws, cfg, now_fn=clock)
+        result = hb.handle_message("owner", "你记住，我喜欢吃菠萝和芒果")
+        assert result.says == ["好，菠萝和芒果我记住了。"]
+        assert result.ticks[0].actions.memorized
+        assert any("记忆回填" in e for e in result.ticks[0].actions.errors)
+        episodes = sorted(ws.episodes.glob("*.json"))
+        assert episodes
+        node = json.loads(episodes[0].read_text(encoding="utf-8"))
+        assert node["lod0"] == "主人喜欢吃菠萝和芒果"
+        assert node["visibility"] == ["owner"]
+        assert node["epistemic"] == "direct"
+        # 抽取只在“值得记 + 模型没写 ops”时发生：这一轮共 3 次请求
+        assert server.calls == 3
+
+
+def test_memory_pass_skipped_when_model_already_wrote_ops(tmp_path: Path, clock):
+    ops = [{"op": "memorize", "lod0": "喜欢菠萝", "lod1": "要点", "lod2": "全文"}]
+    with FakeOpenAI(
+        lambda p, h: chat_reply(json.dumps(packet(say="记下了。", memory_ops=ops), ensure_ascii=False))
+    ) as server:
+        cfg = make_config(server.base_url)
+        ws = Workspace.open(tmp_path / "xingli", cfg)
+        hb = Heartbeat.create(ws, cfg, now_fn=clock)
+        hb.handle_message("owner", "记住：我喜欢菠萝")
+    assert server.calls == 1
+    assert list(ws.episodes.glob("*.json"))
+
+
+def test_memory_pass_can_be_disabled(tmp_path: Path, clock):
+    with FakeOpenAI(lambda p, h: chat_reply("先说重点：我在。")) as server:
+        cfg = make_config(server.base_url, memory_pass=False)
+        ws = Workspace.open(tmp_path / "xingli", cfg)
+        hb = Heartbeat.create(ws, cfg, now_fn=clock)
+        result = hb.handle_message("owner", "记住，我喜欢菠萝")
+    assert not result.ticks[0].actions.memorized
+    assert not list(ws.episodes.glob("*.json"))
+    assert server.calls == 1

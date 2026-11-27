@@ -11,6 +11,7 @@
     /files [n]         长期记忆清单（文件大小 / 认识论 / 重要度 / LOD0）
     /cat <id|路径>     直接看某条记忆的原始 JSON（记忆文件长什么样）
     /tree              cortex/ 的目录树与占用
+    /prefill on|off    预填 JSON 开头（思考型模型不肯按格式输出时的杀手锏）
     /status            端点连通性、模型、Token 预算与记忆统计
     /as <speaker_id>   切换当前说话人（测试隐私墙与社交反哺）
     /who               当前说话人与其关系档案
@@ -41,8 +42,8 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import viewer
@@ -79,10 +80,31 @@ class ChatCLI:
         self.config_path = config_path
         self.mode_stats: dict[str, int] = {}
         self.running = True
-        # 单线程执行器：聊天与自主唤醒排队执行，避免并发写记忆
-        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xingli")
+        # 聊天与自主唤醒串行执行（避免并发写记忆）；线程用 daemon，
+        # 这样在等模型时按 Ctrl-C 能立刻退出，不会被 atexit join 卡住。
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
+    def _serialized(self, fn, *args):
+        with self._lock:
+            return fn(*args)
+
+    async def _call(self, fn, *args):
+        """在守护线程里跑阻塞调用：按 Ctrl-C 时不必等 HTTP 请求收尾。"""
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        def runner() -> None:
+            try:
+                result = fn(*args)
+            except BaseException as exc:  # noqa: BLE001 - 交回事件循环
+                loop.call_soon_threadsafe(future.set_exception, exc)
+            else:
+                loop.call_soon_threadsafe(future.set_result, result)
+
+        threading.Thread(target=runner, daemon=True, name="xingli-call").start()
+        return await future
+
     def _gen_stats(self) -> tuple[float | None, int | None]:
         timings = getattr(self.hb.sys2, "last_timings", None) or {}
         usage = getattr(self.hb.sys2, "last_usage", None) or {}
@@ -154,11 +176,10 @@ class ChatCLI:
 
     # ------------------------------------------------------------------
     async def _poll_wakes(self) -> None:
-        loop = asyncio.get_running_loop()
         while self.running:
             baseline = viewer.snapshot(self.ws.cortex) if self.show_memory else None
             try:
-                results = await loop.run_in_executor(self.pool, self.hb.poll_wakes)
+                results = await self._call(self._serialized, self.hb.poll_wakes)
             except Exception as exc:  # noqa: BLE001
                 print(f"⟨调度器异常⟩ {type(exc).__name__}: {exc}")
                 results = []
@@ -199,8 +220,8 @@ class ChatCLI:
                 baseline = viewer.snapshot(self.ws.cortex) if self.show_memory else None
                 print(THINKING_HINT, end="", flush=True)
                 try:
-                    result = await asyncio.get_running_loop().run_in_executor(
-                        self.pool, self.hb.handle_message, self.speaker, line
+                    result = await self._call(
+                        self._serialized, self.hb.handle_message, self.speaker, line
                     )
                 except Sys2Error as exc:
                     self._clear_hint()
@@ -213,7 +234,6 @@ class ChatCLI:
         finally:
             self.running = False
             poller.cancel()
-            self.pool.shutdown(wait=False)
 
     @staticmethod
     def _clear_hint() -> None:
@@ -314,6 +334,10 @@ class ChatCLI:
                 f"预算：帧 {cfg.budget.frame_tokens} · 连环 {cfg.budget.max_chain_ticks} 拍 · "
                 f"契约 {cfg.sys2.contract} · 结构化输出 {cfg.sys2.structured_output}"
             )
+            print(
+                f"降级开关：预填 {getattr(self.hb.sys2, 'prefill', 'n/a')}"
+                f"（自动 {cfg.sys2.auto_prefill}）· 记忆回填 {cfg.sys2.memory_pass}"
+            )
             frame = self.hb.last_frame
             if frame:
                 from kernel.textutil import estimate_tokens
@@ -347,6 +371,21 @@ class ChatCLI:
                 )
         elif cmd == "/who":
             print(json.dumps(self.hb.relations.get(self.speaker), ensure_ascii=False, indent=2))
+        elif cmd == "/prefill":
+            client = self.hb.sys2
+            if not hasattr(client, "prefill"):
+                print("（当前 System Two 不是 HTTP 端点，没有预填）")
+                return
+            mode = (arg or "").strip().lower()
+            if mode in {"", "on", "say"}:
+                client.prefill = "say"
+                print("预填已开：让模型接着 `{\"say\": \"` 往下写（本次会话有效）")
+                print('  想持久化：在 xingli.toml 的 [sys2] 加 prefill = "say"')
+            elif mode in {"off", "none"}:
+                client.prefill = "off"
+                print("预填已关")
+            else:
+                print("用法：/prefill on|off")
         elif cmd == "/thought":
             self.show_thought = not self.show_thought
             print(f"内心 OS 打印：{'开' if self.show_thought else '关'}")
@@ -383,7 +422,7 @@ class ChatCLI:
         elif cmd == "/sleep":
             baseline = viewer.snapshot(self.ws.cortex) if self.show_memory else None
             print("（开始睡眠整合……）")
-            report = await asyncio.get_running_loop().run_in_executor(self.pool, self.hb.sleep)
+            report = await self._call(self._serialized, self.hb.sleep)
             print(report.summary())
             for sample in report.samples:
                 mark = "✓" if sample.passed else "✗"
@@ -454,6 +493,7 @@ temperature = 0.7
 max_tokens = {max_tokens}
 contract = "{contract}"      # full（默认）| compact（小模型 / 上下文紧张）
 structured_output = "auto"    # auto: json_schema → json_object → 关；llama.cpp 会据此做语法约束
+prefill = "{prefill}"            # off | say：预填 JSON 开头，逼思考型模型直接说人话
 # contract_in_user = true     # 某些模型的 chat template 会吞掉 system：在帧末尾再贴一次短提醒
 
 [sys1]
@@ -483,6 +523,7 @@ def write_config(
     sys1_model: str = "",
     contract: str = "full",
     max_tokens: int = 1000,
+    prefill: str = "off",
     path: Path | None = None,
 ) -> Path:
     target = path or (root / "xingli.toml")
@@ -498,6 +539,7 @@ def write_config(
             sys1_model=sys1_model or model,
             contract=contract,
             max_tokens=max_tokens,
+            prefill=prefill,
         ),
         encoding="utf-8",
     )
@@ -630,16 +672,22 @@ def _selftest(root: Path, cfg: Config) -> int:
     for tick in result.ticks:
         if tick.packet and tick.packet.inner_monologue:
             print(f"  内心 OS：{tick.packet.inner_monologue.splitlines()[0][:120]}")
+        seen: set[str] = set()
         for warn in tick.actions.errors:
-            print(f"  ⚠ {warn}")
+            if warn not in seen:
+                seen.add(warn)
+                print(f"  ⚠ {warn}")
         for warn in tick.packet.parse_warnings if tick.packet else []:
-            print(f"  ⚠ 解析：{warn}")
+            if warn not in seen:
+                seen.add(warn)
+                print(f"  ⚠ 解析：{warn}")
     for say in result.says:
         print(f"  她说：{say[:160]}")
     if last.mode != "json":
         print(
-            "  建议：① 用 --fast 重跑（compact 契约 + 短输出）；② 若模型模板可能吞掉 system，"
-            "在 xingli.toml 里加 contract_in_user = true；③ 确认 llama.cpp 版本支持 json_schema；"
+            "  建议：① 在聊天里发 /prefill on 再试（思考型模型的杀手锏，立即生效）；"
+            "② --fast 重跑（compact 契约 + 短输出）；"
+            "③ 若模板会吞 system，加 contract_in_user = true；"
             "④ 换更守 JSON 的 instruct 模型"
         )
     if not result.says and not result.ticks[-1].actions.errors:
@@ -687,6 +735,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="本地小模型省时档：compact 契约 + max_tokens 700（--init-config 时生效）",
     )
+    parser.add_argument(
+        "--prefill",
+        action="store_true",
+        help="让模型接着 `{\"inner_monologue\": \"\", \"say\": \"` 往下写（思考型模型适用）",
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve() if args.root else Path.cwd()
@@ -700,6 +753,7 @@ def main(argv: list[str] | None = None) -> int:
             sys1_model=args.sys1_model,
             contract="compact" if args.fast else args.contract,
             max_tokens=700 if args.fast else 1000,
+            prefill="say" if args.prefill else "off",
             path=Path(args.config) if args.config else None,
         )
         print(f"已写入配置：{path}")

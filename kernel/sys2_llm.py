@@ -19,7 +19,13 @@ import urllib.request
 from typing import Any, Protocol
 
 from kernel.config import Config
-from kernel.jsonx import loads_lenient, message_text, strip_fences
+from kernel.jsonx import (
+    loads_lenient,
+    looks_like_reasoning,
+    message_text,
+    salvage_say,
+    strip_fences,
+)
 from kernel.models import ThoughtPacket, dumps
 from kernel.textutil import one_line
 
@@ -42,6 +48,7 @@ SYSTEM_CONTRACT = """你是「星璃」。你不是在复述聊天记录，而�
 9. evolve_ops: [{"op":"teach_rule","rule":"..."} | {"op":"propose_reflex", ...} | {"op":"propose_skill","name":"...","code":"...","reason":"..."}]
 
 【说话方式】
+- **不要叙述你的分析过程**（不要写“首先/用户要求/我来分析/字段是……”）。要思考就写进 inner_monologue。
 - 第一人称、有判断、有温度、不客套模板。被问到"你是谁/你是什么/介绍一下自己"时，
   直说你是谁、你怎么记事（焦点视距、长期记忆、自己的 Git 账本），不要背说明书，也不要空泛。
 - 别把认知帧的分段名、哈希句柄、JSON 字段名说给人类听。
@@ -72,7 +79,7 @@ SYSTEM_CONTRACT_COMPACT = """你是「星璃」。你在一帧极短的世界快
 5. emotion_delta: {"warmth":0.05} | {}
 6. wake: {"continue_think":{"reason":"..."}|null,"schedule_wake":null}
 
-规则：转述标注「待核实」的不能当事实；别人的私密你看不到；想先查证就用 recall + continue_think，下一拍会看到结果；一次事件最多 4 拍。
+规则：不要叙述分析过程（不写“首先/用户要求/我来分析”），思考写进 inner_monologue；转述标注「待核实」的不能当事实；别人的私密你看不到；想先查证就用 recall + continue_think，下一拍会看到结果；一次事件最多 4 拍。
 帧分段：[SITUATIONAL_ENV] 时间/说话人/关系 [SYS1_INTUITION] 直觉 [FOCAL_DIALOGUE] 近况 [LONG_TERM_LANDSCAPE] 长期记忆（#哈希可 recall） [CURRENT_EVENT] 此刻事件"""
 
 #: 可选的行动契约（``[sys2] contract = "full" | "compact"``）
@@ -147,6 +154,12 @@ THOUGHT_SCHEMA: dict[str, Any] = {
 }
 
 
+#: 预填的 assistant 开头：让它“接着说”，而不是先长篇叙事再给 JSON
+PREFILL_HEADS = {
+    "say": '{"inner_monologue": "", "say": "',
+}
+
+
 def response_formats(mode: str) -> list[str]:
     """结构化输出方式的降级阶梯。``auto`` = 语法约束 → JSON 模式 → 关闭。"""
     mode = (mode or "auto").strip().lower()
@@ -163,6 +176,15 @@ def looks_like_json_attempt(text: str) -> bool:
     if body.lstrip().startswith("{"):
         return True
     return "{" in body and any(h in body for h in ("inner_monologue", "say", "memory_ops"))
+
+
+MEMORY_EXTRACT_SYSTEM = (
+    "你是记忆抽取器。只输出一个 JSON 对象，不要解释、不要叙述过程：\n"
+    '{"memory_ops":[{"op":"memorize","lod0":"一句话","lod1":"两三句要点",'
+    '"lod2":"原话","importance":0.6,"tags":[]}]}\n'
+    "只抽取值得长期记住的东西：偏好、计划、约定、边界、称呼、身体状况。"
+    '没有就输出 {"memory_ops": []}。'
+)
 
 
 class Sys2Error(RuntimeError):
@@ -201,6 +223,7 @@ class OpenAICompatibleClient:
     def __init__(self, config: Config):
         self.config = config
         cfg = config.sys2
+        self.prefill = cfg.prefill if cfg.prefill in PREFILL_HEADS else "off"
         if not cfg.base_url:
             raise Sys2Error("sys2.base_url 未配置（例如 http://127.0.0.1:8080/v1）")
         self.model = cfg.model or "local-model"
@@ -287,7 +310,7 @@ class OpenAICompatibleClient:
         last_error: Exception | None = None
         while fi < len(formats):
             payload = self._payload(
-                messages,
+                self._with_prefill(messages),
                 response_format=formats[fi],
                 temperature=temperature,
                 max_tokens_key=max_tokens_key,
@@ -333,12 +356,85 @@ class OpenAICompatibleClient:
                 raise
             self.last_timings = data.get("timings") or {}
             self.last_usage = data.get("usage") or {}
-            return message_text(data)
+            return self._restore_prefill(message_text(data))
         raise Sys2Error(str(last_error or "响应格式协商失败"))
+
+    # ------------------------------------------------------------------
+    def _with_prefill(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        head = PREFILL_HEADS.get(self.prefill)
+        if not head:
+            return messages
+        if messages and messages[-1].get("role") == "assistant":
+            return messages
+        return [*messages, {"role": "assistant", "content": head}]
+
+    def _restore_prefill(self, text: str) -> str:
+        """把预填头拼回去；有些端点会把它原样回显，那就不要重复拼。"""
+        head = PREFILL_HEADS.get(self.prefill)
+        if not head or not text:
+            return text
+        if text.lstrip().startswith("{"):
+            return text
+        return head + text
 
     def _note(self, text: str) -> None:
         self.notes.append(text)
         del self.notes[:-20]  # 只留最近 20 条
+
+    # ------------------------------------------------------------------
+    def extract_memory_ops(self, user_text: str, reply_text: str) -> list[dict[str, Any]]:
+        """弱模型补洞：再用一次极短请求，把“值得记住的事”抽成 memory_ops。
+
+        只在模型自己没写 memory_ops、且这句话看起来值得记的时候调用（boot 判断）。
+        失败就返回空列表——记忆宁缺毋滥，不许编。
+        """
+        cfg = self.config.sys2
+        if not cfg.memory_pass:
+            return []
+        saved_prefill, self.prefill = self.prefill, "off"
+        try:
+            text = self._chat(
+                [
+                    {"role": "system", "content": MEMORY_EXTRACT_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"对方说：{user_text[:800]}\n"
+                            f"你的回答：{reply_text[:400]}\n"
+                            "现在输出 JSON。"
+                        ),
+                    },
+                ],
+                temperature=0.1,
+            )
+        except Sys2Error as exc:
+            self._note(f"记忆抽取失败：{exc}")
+            return []
+        finally:
+            self.prefill = saved_prefill
+        data = loads_lenient(text)
+        if isinstance(data, dict):
+            ops = data.get("memory_ops")
+        elif isinstance(data, list):
+            ops = data
+        else:
+            ops = None
+        if not isinstance(ops, list):
+            self._note("记忆抽取返回的不是 JSON，已放弃这一拍的回填")
+            return []
+        clean: list[dict[str, Any]] = []
+        for op in ops[:3]:
+            if not isinstance(op, dict):
+                continue
+            lod0 = str(op.get("lod0") or op.get("text") or "").strip()
+            if not lod0:
+                continue
+            op = dict(op)
+            op.setdefault("op", "memorize")
+            op.setdefault("lod1", lod0)
+            op.setdefault("lod2", lod0)
+            clean.append(op)
+        return clean
 
     # ------------------------------------------------------------------
     def complete(self, system: str, user: str) -> str:
@@ -348,6 +444,32 @@ class OpenAICompatibleClient:
             {"role": "user", "content": user},
         ]
         text = self._chat(messages)
+        if (
+            cfg.auto_prefill
+            and self.prefill == "off"
+            and loads_lenient(text) is None
+            and looks_like_reasoning(text)
+        ):
+            # 它在写“首先/用户要求……”而不是 JSON：直接预填一次，逼它接着说人话
+            self._note("检测到模型在叙述分析过程，已用预填强制输出一次")
+            self.prefill = "say"
+            try:
+                retry = self._chat(messages)
+            except Sys2Error as exc:
+                self._note(f"预填重试失败：{exc}")
+            else:
+                if loads_lenient(retry) is not None:
+                    return retry
+                salvaged = salvage_say(retry)
+                if salvaged:
+                    return salvaged
+            finally:
+                self.prefill = "off"
+        if self.prefill != "off" and loads_lenient(text) is None:
+            salvaged = salvage_say(text)
+            if salvaged:
+                self._note("预填模式下 JSON 未闭合，已抢救出 say（本拍无记忆动作）")
+                return salvaged
         if cfg.repair and loads_lenient(text) is None and looks_like_json_attempt(text):
             self._note("模型输出不是 JSON，追加一次修复请求")
             repair_messages = [
@@ -452,6 +574,61 @@ class MockSys2Client:
     def __init__(self, force_continue: bool = False):
         self.force_continue = force_continue
         self.calls = 0
+
+    # ------------------------------------------------------------------
+    def extract_memory_ops(self, user_text: str, reply_text: str) -> list[dict[str, Any]]:
+        """弱模型补洞：再用一次极短请求，把“值得记住的事”抽成 memory_ops。
+
+        只在模型自己没写 memory_ops、且这句话看起来值得记的时候调用（boot 判断）。
+        失败就返回空列表——记忆宁缺毋滥，不许编。
+        """
+        cfg = self.config.sys2
+        if not cfg.memory_pass:
+            return []
+        saved_prefill, self.prefill = self.prefill, "off"
+        try:
+            text = self._chat(
+                [
+                    {"role": "system", "content": MEMORY_EXTRACT_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"对方说：{user_text[:800]}\n"
+                            f"你的回答：{reply_text[:400]}\n"
+                            "现在输出 JSON。"
+                        ),
+                    },
+                ],
+                temperature=0.1,
+            )
+        except Sys2Error as exc:
+            self._note(f"记忆抽取失败：{exc}")
+            return []
+        finally:
+            self.prefill = saved_prefill
+        data = loads_lenient(text)
+        if isinstance(data, dict):
+            ops = data.get("memory_ops")
+        elif isinstance(data, list):
+            ops = data
+        else:
+            ops = None
+        if not isinstance(ops, list):
+            self._note("记忆抽取返回的不是 JSON，已放弃这一拍的回填")
+            return []
+        clean: list[dict[str, Any]] = []
+        for op in ops[:3]:
+            if not isinstance(op, dict):
+                continue
+            lod0 = str(op.get("lod0") or op.get("text") or "").strip()
+            if not lod0:
+                continue
+            op = dict(op)
+            op.setdefault("op", "memorize")
+            op.setdefault("lod1", lod0)
+            op.setdefault("lod2", lod0)
+            clean.append(op)
+        return clean
 
     # ------------------------------------------------------------------
     def complete(self, system: str, user: str) -> str:

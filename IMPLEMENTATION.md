@@ -8,7 +8,7 @@
 
 纯标准库 Python 实现了 M1–M4 的核心闭环：**认知帧 + 焦点双向 LOD + 结构化认知包（可选代码载荷）
 + System One 三段门控 + 物理隐私墙/信源溯源 + 受控自进化（AST 审计/子进程试跑/回归/Git 账本）
-+ 睡眠整合（蒸馏/衰减/反失忆抽查）**，并配有 105 个 pytest（其中 33 个打在本地假端点，验证真实协议路径）与一个 50 项机制的离线验证脚本。
++ 睡眠整合（蒸馏/衰减/反失忆抽查）**，并配有 112 个 pytest（其中 41 个打在本地假端点，验证真实协议路径）与一个 50 项机制的离线验证脚本。
 
 它**没有**验证的部分也写在明处：真实底座模型的表达质量、真实 Jev 端点的语义准确率、
 任何 benchmark 成绩。离线 `mock` 大脑是**确定性脚本**，只负责让管线可复现。
@@ -22,7 +22,7 @@
 python demo.py
 
 # 2) 自动化测试
-python -m pytest -q            # 105 passed
+python -m pytest -q            # 112 passed
 
 # 3) CLI 聊天台（离线）
 python cli.py --mock
@@ -35,6 +35,9 @@ python cli.py --ping        # /v1/models 探测
 python cli.py --selftest    # 真跑一轮 + 打印新建记忆文件
 python cli.py               # 开聊（每轮打印记忆变化）
 ```
+
+CLI 的阻塞调用跑在守护线程里：等模型时按 Ctrl-C 会立刻退出，
+不会在 Windows 上抛 `Exception ignored on threading shutdown`。
 
 运行时产生的记忆、账本、状态都在 `.xingli/` 与 `cortex/{episodes,turns,state}/`（已 gitignore）；
 它们由 `cortex/` 自己的 Git 账本（`.xingli/ledger.git`）追踪，不会污染主仓库历史。
@@ -151,6 +154,21 @@ json_schema（llama.cpp 会转成 GBNF，语法上强制出合法 JSON）
 **她是谁**：`cortex/persona.py` 的 `SELF_CONCEPT / VALUES / TRAITS` 会被压成一段恒定的
 「身份块」放在 system 提示最前面（约 250 tokens，不随对话增长）。这是实现时补的——
 SPEC 没写，但没有它，底座模型根本不知道自己叫星璃，更不会用第一人称讲自己。
+
+### 思考型 / 极弱模型的三道保险
+
+真实测试里最常见的失败不是“不会说话”，而是**模型把思考过程写进正文**（`首先，用户要求只输出合法JSON…`），
+然后被输出上限截断，既没有 JSON 也没有一句人话。为此加了三条，全部是显式降级、可关闭：
+
+| 保险 | 触发 | 行为 | 开关 |
+|---|---|---|---|
+| 预填（prefill） | 正文以“首先/用户要求/我来分析…”开头，或手动开启 | 追加一条 assistant 消息 `{"inner_monologue": "", "say": "`，让模型**接着说**；截断时用 `salvage_say` 抢救已写的句子 | `prefill = "say"` / `auto_prefill` / `/prefill on` |
+| 记忆回填（memory pass） | 这句话含“记住/喜欢/约定/…”且模型没写 `memory_ops` | 再发一次极短抽取请求，结果仍走 `_op_memorize`（隐私与 hearsay 铁律一条不少） | `memory_pass = true` |
+| 帧内格式提醒 | `chat template` 吞掉 system 消息 | 在帧末尾追加一行 `[OUTPUT_FORMAT]` 短提醒 | `contract_in_user = true` |
+
+预填的代价要说明白：被预填的那一拍通常只产出 `say`（模型把话说完了就收尾），
+所以**长期记忆要靠“记忆回填”这一趟**才能长出来；记忆回填失败就是没有记忆，绝不编。
+结构化 JSON 通道仍然是主路径——这三条只在模型不守契约时兜底，且全程在终端里标注。
 
 **降级但绝不装死**：如果模型输出既不是 JSON 也不是代码，内核按「纯发言」处理——
 `say` 照样上屏、轮次照样落盘，但这一拍没有记忆/进化动作，并在 `actions.errors` 与 CLI
@@ -383,6 +401,7 @@ score = 0.40·语义相似 + 0.20·时间近度(半衰 7 天) + 0.25·重要度
 | Sys1 `llm_fallback` 解析 / 降级 / 断路器打开与恢复 | `tests/test_sys1_http.py`（6 项） |
 | `--init-config` / `--ping` / `--say --show-memory` / `--selftest` | `tests/test_cli.py`（5 项） |
 | 紧凑契约真的更短、未被契约的字段别名被接住 | `tests/test_openai_compat.py` / `tests/test_packet_aliases.py`（5 项） |
+| 思考型模型自动预填、截断抢救、记忆回填、开关生效 | `tests/test_identity_and_fallback.py`（7 项） |
 | 身份块来自 cortex/persona.py 且可被改写、纯发言降级、schema→object→off 阶梯、帧末尾格式提醒 | `tests/test_identity_and_fallback.py`（7 项） |
 | 记忆快照求差、`/cat` 路径解析、`/files` 渲染 | `tests/test_viewer.py`（7 项） |
 

@@ -229,6 +229,7 @@ llama-server -m qwen2.5-7b-instruct-q4_k_m.gguf -c 8192 --port 8080
 python cli.py --init-config --base-url http://127.0.0.1:8080/v1 \
               --model qwen2.5-7b-instruct-q4_k_m
 # 7B 级别 / 纯 CPU 建议加 --fast（compact 契约 + 输出 700 tokens，明显更快）
+# “思考型”模型（会把「首先/用户要求…」写进正文）再加 --prefill：预填 JSON 开头逼它说人话
 
 python cli.py --ping        # 端点在线吗？模型名对得上吗？
 python cli.py --selftest    # 真跑一轮：认知包解析 + 新建的记忆文件原样打印
@@ -252,8 +253,28 @@ python cli.py               # 开始聊
 `id → lod0 → lod1 → lod2 → 来源/认识论/可见性 → 时间`，自上而下就是“她记住了什么”。
 
 如果模型不肯按 JSON 输出，她会**降级成“纯发言”**而不是沉默：照样说话、照样记轮次，
-但那一拍没有记忆/进化动作，并在终端里如实标出 `⟨降级⟩`。`/status` 会给你本会话的
-"守约率"（json / prose 各几拍）——这是模型的问题，不是架构假装的。
+并在终端里如实标出 `⟨降级⟩`。两件事会自动兜底：
+
+- **检测到“首先/用户要求……”这类分析叙述** → 自动用预填再试一次（`{"inner_monologue": "", "say": "`），
+  把长篇叙事压成一句话；也可手动 `/prefill on`；
+- **该记的事没被模型写进 memory_ops** → 内核再发一次极短的记忆抽取（仍走隐私/信源铁律），
+  终端会显示 `⟨内核⟩ 记忆回填：…（弱模型降级路径）`。
+
+`/status` 会给你本会话的"守约率"（json / prose 各几拍）——这是模型的问题，不是架构假装的。
+
+### System One 也可以接本地模型
+
+你机器上若已有决策向小模型（Kev / Jev / decision 系列），把它们接到丘脑，省掉本地词法的近似：
+
+```toml
+[sys1]
+provider = "llm_fallback"        # 真 /v1/systemone 端点用 "jev"
+base_url = "http://127.0.0.1:8080/v1"
+model = "Kev-4B-GGUF"
+timeout_sec = 8
+```
+
+连续失败两次会打开 60s 断路器，自动退回本地词法——端点挂了也不会让每一拍都白等超时。
 
 > 端点无论叫 OpenAI 还是 Jev，只要是 OpenAI 兼容的 `/chat/completions`，都能直接接：
 > System Two 用 `[sys2] provider = "openai_compatible"`；System One 若要真调模型，
@@ -264,7 +285,7 @@ python cli.py               # 开始聊
 
 ```bash
 python demo.py          # 50 项机制验证：帧长、公式误差、隐私墙、拦截率……都打印实测数字
-python -m pytest -q     # 105 项自动化测试（含假端点上的真实协议测试）
+python -m pytest -q     # 112 项自动化测试（含假端点上的真实协议测试）
 python cli.py --mock    # mock 大脑：/as 换人 /frame 看帧 /focus 看视距 /sleep /log /rollback
 ```
 
@@ -279,7 +300,7 @@ python cli.py --mock    # mock 大脑：/as 换人 /frame 看帧 /focus 看视�
 
 - 架构、数据契约、验收标准：**完成**（SPEC + MIT）
 - 早期验证实验：v1 轶事有效，**无受控数据**
-- 实现：**M1–M4 核心闭环已落地**（纯标准库 Python；105 项 pytest（含 33 项打在假端点上的真实协议测试）+ 50 项离线机制验证，`python demo.py` 可复现）
+- 实现：**M1–M4 核心闭环已落地**（纯标准库 Python；112 项 pytest（含 41 项打在假端点上的真实协议测试）+ 50 项离线机制验证，`python demo.py` 可复现）
 - 离线机制验证（mock 大脑，不是真实模型）：60 轮后认知帧 1492 tokens（预算 6000）且不随轮数增长 · 焦点 LOD 公式误差 0 · A 的私密在 B 的帧中物理不存在 · 恶意进化提案 100% 拦截并沉淀免疫记忆 · 反失忆抽查 67% → 100%
 - 仍未验证：真实底座模型的表达质量、真实 Jev 端点的语义准确率、任何 benchmark
 - 基准 / 第三方评测：**无**

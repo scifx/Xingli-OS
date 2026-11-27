@@ -117,3 +117,53 @@ def message_text(payload: dict[str, Any], hints: Iterable[str] = PACKET_HINTS) -
         if loads_lenient(text) is not None:
             return text
     return cleaned[0] if cleaned else ""
+
+
+_SAY_IN_TEXT = re.compile(r'"say"\s*:\s*"((?:[^"\\]|\\.)*)"', re.DOTALL)
+
+
+def salvage_say(text: str) -> str:
+    """从“没写完/写坏”的输出里抢救一句能说的话。
+
+    优先级：完整的 ``"say": "…"`` → 未闭合的 ``"say": "``（预填时最常见）→ 整段散文。
+    返回空串表示确实没东西可说。
+    """
+    body = strip_fences(text or "")
+    m = _SAY_IN_TEXT.search(body)
+    if m:
+        try:
+            return json.loads('"' + m.group(1) + '"').strip()
+        except json.JSONDecodeError:
+            return m.group(1).strip()
+    open_m = re.search(r'"say"\s*:\s*"', body)
+    if open_m:
+        tail = body[open_m.end():]
+        for cut in ('"}', '"', "}"):
+            if tail.endswith(cut):
+                tail = tail[: -len(cut)]
+        return tail.strip()
+    # 兜底：去掉可能的收尾引号/括号（预填头本身已在上面处理）
+    stripped = body.strip()
+    while True:
+        before = stripped
+        stripped = stripped.rstrip()
+        for tail in ('"}', "}", '"'):
+            if stripped.endswith(tail):
+                stripped = stripped[: -len(tail)]
+                break
+        if stripped == before:
+            break
+    return stripped.strip()
+
+
+_REASONING_START = re.compile(
+    r"^\s*(首先|第一|用户要求|用户说|我们需要|我来分析|让我|分析一下|好的[，,].{0,12}(分析|思考)|"
+    r"the user|first[,，]|let me|i need to|okay[,，])",
+    re.IGNORECASE,
+)
+
+
+def looks_like_reasoning(text: str) -> bool:
+    """模型把“思考过程”写进了正文（思考型模型的典型症状）。"""
+    body = strip_fences(text or "").strip()
+    return bool(body) and bool(_REASONING_START.match(body))

@@ -25,6 +25,9 @@ contract = "full"             # full | compact：7B 级别或上下文紧张时�
 json_mode = true              # 端点不支持 response_format 时自动降级
 structured_output = "auto"    # json_schema（语法约束）→ json_object → 关
 # contract_in_user = true     # 若模型的 chat template 吞掉 system：在帧末尾再贴短提醒
+prefill = "off"               # say：预填 {"inner_monologue":"","say":" 逼思考型模型直接说人话
+auto_prefill = true           # 检测到“首先/用户要求…”时自动预填重试一次
+memory_pass = true            # 模型没写 memory_ops 时，内核补抽一次（走同样的隐私/信源规则）
 repair = true                 # 输出不是 JSON 时追加一次“只要 JSON”的修复请求
 retries = 1                   # 连接失败重试次数（降级重试不计入）
 # 额外字段原样并入请求体。若模型把预算全花在思考上导致 content 为空：
